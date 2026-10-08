@@ -718,6 +718,69 @@ def test_ambiguous_name_offers_choices():
     assert "Which one" in r.sent[-1] and len(sent_buttons[-1]) == 3
 
 
+# ---------------------------------------------------------------- honest track record
+class FakeMarket:
+    """quote() and index_stocks() for the evaluation step."""
+    def __init__(self, prices, nifty, stamp):
+        self.prices, self.nifty, self.stamp = prices, nifty, stamp
+        self.index_level = {}
+
+    def quote(self, sym):
+        return {"lastPrice": self.prices[sym], "timestamp": self.stamp + " 16:00:00"}
+
+    def index_stocks(self, idx):
+        self.index_level[idx] = (self.nifty, self.stamp)
+        return [], self.stamp
+
+
+def test_predictions_are_judged_at_next_close_and_counted_honestly():
+    import time
+    from datetime import timedelta
+    r = make_radar()
+    t = M.now()
+    r.nse = FakeMarket({"AAA": 100.0, "BBB": 50.0, "CCC": 10.0, "DDD": 20.0}, 22000.0, t.strftime("%d-%b-%Y"))
+    r.next_session = lambda _t: t.date().isoformat()    # pretend the target session is today
+    r.record_prediction("AAA", "certainty", "very high", 1, "big order")
+    r.record_prediction("BBB", "breaking", "85%", -1, "grounding")
+    r.record_prediction("CCC", "opportunity", "75/100", 1, "filing + 3 outlets")
+    r.record_prediction("DDD", "story", "large", 1, "contract")
+    r.record_prediction("AAA", "opportunity", "80/100", 1, "same call again")   # same call, other type
+    r.record_prediction("AAA", "certainty", "very high", 1, "dup")             # exact duplicate: ignored
+    assert len(r.store.predictions()) == 5
+    # the market closes
+    r.store.log_event("DDD", "news", "DDD contract cancelled", "-", "HIGH", "ET")
+    r.nse.prices = {"AAA": 104.0, "BBB": 52.0, "CCC": 10.02, "DDD": 19.0}   # right, wrong, flat, wrong
+    r.nse.nifty = 22110.0
+    r.evaluate_predictions()
+    res = {p["symbol"] + p["kind"]: p["result"] for p in r.store.predictions()}
+    assert res == {"AAAcertainty": "correct", "BBBbreaking": "wrong", "CCCopportunity": "flat",
+                   "DDDstory": "wrong", "AAAopportunity": "correct"}, res
+    lines, _ = r.track_view("summary")
+    text = "\n".join(lines)
+    assert "1 of 4 correct (25%)" in text, text          # AAA counted once overall, not twice
+    assert "contrary news came later (still counted)" in text
+    assert "all 5 entries untouched" in text
+
+
+def test_tampering_is_detected():
+    r = make_radar()
+    r.nse = FakeMarket({"AAA": 100.0}, 22000.0, M.now().strftime("%d-%b-%Y"))
+    r.record_prediction("AAA", "breaking", "90%", 1, "x")
+    r.store.db.execute("UPDATE predictions SET direction = -1 WHERE symbol = 'AAA'"); r.store.db.commit()
+    ok, _n = r.store.verify_predictions()
+    assert not ok
+    assert "altered" in "\n".join(r.track_view()[0])
+
+
+def test_holiday_does_not_judge():
+    r = make_radar()
+    r.nse = FakeMarket({"AAA": 100.0}, 22000.0, "01-Jan-2020")
+    r.next_session = lambda _t: M.now().date().isoformat()
+    r.record_prediction("AAA", "breaking", "90%", 1, "x")
+    r.evaluate_predictions()
+    assert r.store.predictions()[0]["result"] is None
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

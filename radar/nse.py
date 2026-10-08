@@ -30,6 +30,7 @@ class NSE:
         self.s = requests.Session()
         self.s.headers.update(HEADERS)
         self._cookies_at = 0.0
+        self.index_level = {}   # index name -> (level, timestamp text) from the last index fetch
 
     def _warm(self) -> None:
         self.s.cookies.clear()
@@ -131,4 +132,11 @@ class NSE:
         rows = data.get("data", [])
         # The first row is the index itself (priority 1); keep only stocks.
         stocks = [r for r in rows if r.get("priority", 0) == 0 and r.get("symbol") != index_name]
+        for r in rows:
+            if r.get("priority") == 1 or r.get("symbol") == index_name:
+                try:
+                    self.index_level[index_name] = (float(r.get("lastPrice")), data.get("timestamp", ""))
+                except (TypeError, ValueError):
+                    pass
+                break
         return stocks, data.get("timestamp", "")

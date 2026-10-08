@@ -24,6 +24,10 @@ class Store:
             CREATE TABLE IF NOT EXISTS uwatch (chat TEXT, symbol TEXT, PRIMARY KEY (chat, symbol));
             CREATE TABLE IF NOT EXISTS umuted (chat TEXT, symbol TEXT, PRIMARY KEY (chat, symbol));
             CREATE TABLE IF NOT EXISTS upending (chat TEXT, ts REAL, symbol TEXT, text TEXT, score REAL);
+            CREATE TABLE IF NOT EXISTS predictions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, symbol TEXT, kind TEXT, conviction TEXT,
+                direction INTEGER, reason TEXT, p0 REAL, nifty0 REAL, target_day TEXT,
+                p1 REAL, nifty1 REAL, result TEXT, note TEXT, eval_ts REAL, hash TEXT);
             CREATE TABLE IF NOT EXISTS outcomes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, symbol TEXT, kind TEXT,
                 label TEXT, direction INTEGER, p0 REAL, p1h REAL, p1d REAL, t0 REAL);
@@ -217,3 +221,46 @@ class Store:
 
     def has_seen(self, key: str) -> bool:
         return self.db.execute("SELECT 1 FROM seen WHERE key = ?", (key,)).fetchone() is not None
+
+    # --- prediction track record (append-only, tamper-evident) ---------------
+    # Each new prediction's hash covers its own fields AND the previous row's hash, so
+    # editing or deleting any past prediction breaks the chain, and /track shows it.
+    @staticmethod
+    def _pred_hash(prev: str, ts, symbol, kind, conviction, direction, reason, target_day) -> str:
+        import hashlib
+        raw = f"{prev}|{ts:.3f}|{symbol}|{kind}|{conviction}|{direction}|{reason}|{target_day}"
+        return hashlib.sha256(raw.encode()).hexdigest()
+
+    def predict(self, symbol, kind, conviction, direction, reason, p0, nifty0, target_day) -> int:
+        prev = self.db.execute("SELECT hash FROM predictions ORDER BY id DESC LIMIT 1").fetchone()
+        ts = round(time.time(), 3)
+        h = self._pred_hash(prev[0] if prev else "genesis", ts, symbol, kind, conviction, direction, reason[:200], target_day)
+        cur = self.db.execute(
+            "INSERT INTO predictions (ts, symbol, kind, conviction, direction, reason, p0, nifty0, target_day, hash) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (ts, symbol, kind, conviction, direction, reason[:200], p0, nifty0, target_day, h))
+        self.db.commit()
+        return cur.lastrowid
+
+    def predictions(self, where: str = "1=1", args: tuple = ()) -> list:
+        cols = ["id", "ts", "symbol", "kind", "conviction", "direction", "reason", "p0", "nifty0",
+                "target_day", "p1", "nifty1", "result", "note", "eval_ts", "hash"]
+        return [dict(zip(cols, r)) for r in self.db.execute(
+            f"SELECT {', '.join(cols)} FROM predictions WHERE {where} ORDER BY id", args)]
+
+    def prediction_set(self, pid: int, **fields) -> None:
+        allowed = {"p0", "nifty0", "p1", "nifty1", "result", "note", "eval_ts"}
+        assert set(fields) <= allowed  # the prediction itself (symbol, direction, time...) is never changed
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        self.db.execute(f"UPDATE predictions SET {sets} WHERE id = ?", (*fields.values(), pid))
+        self.db.commit()
+
+    def verify_predictions(self) -> tuple:
+        """(ok, count): recompute the hash chain over every prediction ever made."""
+        prev, n = "genesis", 0
+        for p in self.predictions():
+            if self._pred_hash(prev, p["ts"], p["symbol"], p["kind"], p["conviction"], p["direction"],
+                               p["reason"], p["target_day"]) != p["hash"]:
+                return False, n
+            prev, n = p["hash"], n + 1
+        return True, n

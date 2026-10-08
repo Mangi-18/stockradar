@@ -168,6 +168,26 @@ one's tone. News comes from the engine's own history plus a fresh Google News
 search, so it works for any NSE stock, not only ones you track. If the name
 matches several companies, you get buttons to pick.
 
+## 🏆 Track record (honest, tamper-evident)
+
+Every directional call the bot makes (✅ High certainty, ⚡ Breaking, 🎯
+Opportunity, 📣 Story) is written down the moment it's made, with the stock's
+price and the Nifty level at that moment. The High certainty list is recorded
+every 15 minutes whether or not anyone looks at it, so the record isn't
+hand-picked.
+
+Rules, fixed in advance:
+- judged at the **close of the next trading session** that starts after the call
+  (a call at 2pm Thursday is judged at Friday's close; one at 8am Friday, at Friday's close)
+- **correct** = moved ≥0.5% the predicted way; **wrong** = ≥0.5% the other way; **flat** = in between (not counted as correct)
+- **every call counts**: if contrary news arrives later, the miss is labelled but still counted
+- holidays roll to the next session; a call with no price available is shown as void, not dropped
+- the overall score counts each stock, direction and session once, even if several alert types made the same call
+- each entry is hash-chained to the previous one; editing or deleting any past call shows "⚠️ the record was altered"
+
+🏆 Track record shows the hit rate, average move in the predicted direction, how
+often calls beat the Nifty, results by alert type, every miss, and pending calls.
+
 ## 📡 Telegram channels
 
 The owner can add **public** Telegram channels (☰ More → 📡 Channels → ➕ Add

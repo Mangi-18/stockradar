@@ -319,6 +319,8 @@ class Radar:
                         and not self.store.has_seen(u.key("brk", day, sym))
                         and self.store.first_time(u.key("opp", day, sym))):
                     u.send(self.format_opportunity(sym, s, used + 1, u.cfg("maxopp")), buttons=self.stock_buttons(sym))
+                    self.record_prediction(sym, "opportunity", f"{s['score']:.0f}/100", s["direction"],
+                                           s["reasons"][0] if s["reasons"] else "")
                     continue
             if s["score"] >= u.cfg("digestscore") and self.store.first_time(u.key("oppq", day, sym)):
                 u.queue(sym, self.format_candidate(sym, s), s["score"])
@@ -798,8 +800,10 @@ class Radar:
                      + (f" · price today {dc:+.1f}%" if dc is not None else "")]
             if link:
                 lines.append(f'<a href="{esc(link)}">Source</a>')
-            lines.append(f"<i>Single source, not yet confirmed by other outlets. Breaking {n} of {cap} today.</i>")
+            lines.append(f"<i>Single source, not yet confirmed by other outlets. Breaking {n} of {cap} today. "
+                         "📌 Tracked in 🏆 Track record.</i>")
             u.send("\n".join(lines), buttons=self.stock_buttons(sym))
+            self.record_prediction(sym, "breaking", f"{i['confidence']:.0%}", 1 if up else -1, i["why"])
 
     def story_check(self, sym: str, title: str, src: str, ai_i, moved: bool) -> None:
         """📣 A stock is being covered by several outlets at once. Sent (with the AI's
@@ -854,6 +858,8 @@ class Radar:
             lines += [f"• {esc(h[:140])} <i>({esc(o)})</i>" for o, h in outlets[:4]]
             lines.append(f"<i>Story alert {n} of {cap} today.</i>")
             u.send("\n".join(lines), buttons=self.stock_buttons(sym))
+            if ai_i and not moved:
+                self.record_prediction(sym, "story", ai_i["magnitude"], 1 if ai_i["direction"] == "up" else -1, ai_i["why"])
 
     # ================================================================== Telegram channels
     def channel_list(self) -> list:
@@ -929,6 +935,188 @@ class Radar:
         self.store.set(f"chan_init:{name}", "1")
         u.send(f"✅ Now reading @{esc(name)} ({len(posts)} recent posts found). New posts about your "
                "family's stocks will be forwarded.", buttons=self.channels_view()[1])
+
+    # ================================================================== track record
+    # Rules, fixed in advance and shown to the user:
+    #  * a prediction is written down the moment the bot makes it, with the price at that moment
+    #  * it is judged at the close of the next trading session that starts after it was made
+    #  * correct = moved >= 0.5% the predicted way; wrong = >= 0.5% the other way; flat = in between
+    #  * every prediction counts; later news is noted but never excuses a miss
+    FLAT_BAND = 0.5
+    KIND_NAME = {"certainty": "✅ High certainty", "breaking": "⚡ Breaking", "opportunity": "🎯 Opportunity",
+                 "story": "📣 Story"}
+
+    @staticmethod
+    def next_session(t: datetime) -> str:
+        d = t.date()
+        if not (is_weekday(t) and (t.hour, t.minute) < (9, 15)):
+            d += timedelta(days=1)
+        while d.weekday() >= 5:
+            d += timedelta(days=1)
+        return d.isoformat()
+
+    def nifty_now(self):
+        lvl = self.nse.index_level.get("NIFTY 50")
+        if not lvl or not market_open(now()):
+            try:
+                self.nse.index_stocks("NIFTY 50")
+                lvl = self.nse.index_level.get("NIFTY 50")
+            except Exception:
+                return None
+        return lvl[0] if lvl else None
+
+    def price_now(self, sym: str):
+        if market_open(now()) and sym in self.last_price:
+            return self.last_price[sym]
+        try:
+            return float(self.nse.quote(sym)["lastPrice"])
+        except Exception:
+            return None
+
+    def record_prediction(self, sym: str, kind: str, conviction: str, direction: int, reason: str) -> None:
+        if not sym or direction not in (1, -1):
+            return
+        target = self.next_session(now())
+        if not self.store.first_time(f"pred:{kind}:{sym}:{direction}:{target}"):
+            return
+        self.store.predict(sym, kind, conviction, direction, reason or "", self.price_now(sym), self.nifty_now(), target)
+
+    def scan_certainty(self) -> None:
+        """Every 15 minutes: whatever the ✅ High certainty list contains is recorded as a prediction,
+        whether or not anyone tapped the button, so the track record isn't hand-picked."""
+        for it in self.high_certainty(None):
+            o = it["o"]
+            d = o["drivers"].get(o["sign"])
+            self.record_prediction(it["symbol"], "certainty", "very high" if it["very"] else "high", o["sign"],
+                                   short(d, 150) if d else "")
+
+    def evaluate_predictions(self) -> None:
+        """After the close: judge every prediction whose target session was today."""
+        t = now()
+        today = t.date().isoformat()
+        try:
+            _rows, stamp = self.nse.index_stocks("NIFTY 50")
+        except Exception as e:
+            return self.fail("track", e)
+        if t.strftime("%d-%b-%Y").lower() not in (stamp or "").lower():
+            return  # no session today (holiday): targets roll to the next session
+        nifty1 = (self.nse.index_level.get("NIFTY 50") or (None,))[0]
+        quotes = 0
+        for p in self.store.predictions("result IS NULL AND target_day <= ?", (today,)):
+            if p["p0"] is None:
+                self.store.prediction_set(p["id"], result="void", note="no price available when it was made",
+                                          eval_ts=time.time())
+                continue
+            if quotes >= 80:
+                break
+            try:
+                q = self.nse.quote(p["symbol"])
+                quotes += 1
+                time.sleep(0.4)
+            except Exception:
+                if p["target_day"] < (t.date() - timedelta(days=5)).isoformat():
+                    self.store.prediction_set(p["id"], result="void", note="closing price unavailable",
+                                              eval_ts=time.time())
+                continue
+            if t.strftime("%d-%b-%Y").lower() not in str(q.get("timestamp", "")).lower():
+                continue  # stock didn't trade today (suspended?); try again next session
+            p1 = float(q["lastPrice"])
+            move = (p1 - p["p0"]) / p["p0"] * 100 * p["direction"]
+            result = "correct" if move >= self.FLAT_BAND else "wrong" if move <= -self.FLAT_BAND else "flat"
+            later = [e for e in self.store.events_for(p["symbol"], (time.time() - p["ts"]) / 3600)
+                     if e["ts"] > p["ts"] and e["impact"] == HIGH
+                     and {"+": 1, "-": -1}.get(e["tone"], 0) == -p["direction"]]
+            note = "contrary news came later (still counted)" if later and result != "correct" else ""
+            self.store.prediction_set(p["id"], p1=p1, nifty1=nifty1, result=result, note=note, eval_ts=time.time())
+
+    def track_stats(self, rows: list) -> dict:
+        ev = [p for p in rows if p["result"] in ("correct", "wrong", "flat")]
+        n = len(ev)
+        c = sum(p["result"] == "correct" for p in ev)
+        w = sum(p["result"] == "wrong" for p in ev)
+        moves, beat, nb = [], 0, 0
+        for p in ev:
+            r = (p["p1"] - p["p0"]) / p["p0"] * 100 * p["direction"]
+            moves.append(r)
+            if p["nifty0"] and p["nifty1"]:
+                nr = (p["nifty1"] - p["nifty0"]) / p["nifty0"] * 100 * p["direction"]
+                nb += 1
+                beat += r > nr
+        return {"n": n, "correct": c, "wrong": w, "flat": n - c - w,
+                "avg": sum(moves) / n if n else 0.0, "beat": beat, "nb": nb}
+
+    def track_view(self, mode: str = "summary"):
+        allp = self.store.predictions()
+        ok, chain = self.store.verify_predictions()
+        if not allp:
+            return ("🏆 <b>Track record</b>\nNo predictions recorded yet. Every ✅ High certainty, ⚡ Breaking, "
+                    "🎯 Opportunity and 📣 Story call is written down when it's made and judged at the next "
+                    "session's close.", [])
+        # Overall: one call per stock, direction and session, so the same call made by several
+        # alert types isn't counted more than once
+        seen, unique = set(), []
+        for p in allp:
+            k = (p["symbol"], p["direction"], p["target_day"])
+            if k not in seen:
+                seen.add(k)
+                unique.append(p)
+        st = self.track_stats(unique)
+        pending = sum(p["result"] is None for p in unique)
+        void = sum(p["result"] == "void" for p in unique)
+        since = datetime.fromtimestamp(allp[0]["ts"], IST).strftime("%d %b %Y")
+        L = [f"🏆 <b>Track record</b> · every call since {since}"]
+        if st["n"]:
+            L.append(f"<b>{st['correct']} of {st['n']} correct ({st['correct'] / st['n']:.0%})</b> · "
+                     f"❌ {st['wrong']} wrong · ➖ {st['flat']} flat")
+            L.append(f"Average move in the predicted direction: {st['avg']:+.2f}%")
+            if st["nb"]:
+                L.append(f"Did better than the Nifty: {st['beat']} of {st['nb']} ({st['beat'] / st['nb']:.0%})")
+        else:
+            L.append("Nothing judged yet.")
+        L.append(f"⏳ {pending} waiting for their closing price" + (f" · ⚪ {void} void (no price)" if void else ""))
+        if mode == "summary":
+            L.append("\n<b>By type</b>")
+            groups = {}
+            for p in allp:
+                label = self.KIND_NAME.get(p["kind"], p["kind"]) + (
+                    f" · {p['conviction']}" if p["kind"] == "certainty" else "")
+                groups.setdefault(label, []).append(p)
+            for label, rows in groups.items():
+                g = self.track_stats(rows)
+                if g["n"]:
+                    L.append(f"{label}: {g['correct']}/{g['n']} ({g['correct'] / g['n']:.0%}) · avg {g['avg']:+.1f}%")
+                else:
+                    L.append(f"{label}: ⏳ {len(rows)} pending")
+        show = [p for p in reversed(allp) if p["result"] in ("correct", "wrong", "flat")]
+        if mode == "misses":
+            show = [p for p in show if p["result"] != "correct"]
+            L.append("\n<b>Every miss</b>")
+        elif mode == "pending":
+            show = [p for p in reversed(allp) if p["result"] is None]
+            L.append("\n<b>Waiting to be judged</b>")
+        else:
+            L.append("\n<b>Latest results</b>")
+        icon = {"correct": "✅", "wrong": "❌", "flat": "➖", None: "⏳"}
+        for p in show[:15 if mode != "summary" else 8]:
+            made = datetime.fromtimestamp(p["ts"], IST).strftime("%d %b %H:%M")
+            arrow = "↑" if p["direction"] > 0 else "↓"
+            line = f"{icon.get(p['result'], '⚪')} <b>{esc(p['symbol'])}</b> {arrow} · {made} · {self.KIND_NAME.get(p['kind'], p['kind'])}"
+            if p["p1"] and p["p0"]:
+                r = (p["p1"] - p["p0"]) / p["p0"] * 100
+                line += f"\n   ₹{p['p0']:,.2f} → ₹{p['p1']:,.2f} ({r:+.2f}%)"
+                if p["nifty0"] and p["nifty1"]:
+                    line += f" · Nifty {(p['nifty1'] - p['nifty0']) / p['nifty0'] * 100:+.2f}%"
+            else:
+                line += f"\n   judged at the close on {p['target_day']}" + (f" · from ₹{p['p0']:,.2f}" if p["p0"] else "")
+            if p["note"]:
+                line += f"\n   <i>{esc(p['note'])}</i>"
+            L.append(line)
+        L.append(f"\n🔒 Record integrity: {'✅ all ' + str(chain) + ' entries untouched' if ok else '⚠️ the record was altered after entry ' + str(chain)}")
+        L.append("<i>Rules: recorded when made · judged at the next session's close · correct = ≥0.5% the "
+                 "predicted way, wrong = ≥0.5% the other way, flat in between · nothing is ever removed.</i>")
+        rows = [[("❌ Misses", "track:misses"), ("⏳ Pending", "track:pending"), ("🏆 Summary", "track:summary")],
+                [("📊 Signal stats (1h / 1 day)", "cmd:/learn")]]
+        return L, rows
 
     # ================================================================== learning
     def poll_outcomes(self) -> None:
@@ -1143,13 +1331,14 @@ class Radar:
     # ================================================================== buttons & menu
     MENU = [("menu", "Show the button panel"), ("sure", "Only the stocks where the evidence clearly points one way"),
             ("portfolio", "Your stocks with their overall verdict"),
+            ("track", "How many predictions were right and wrong, honestly"),
             ("top", "Strongest candidates right now"), ("brief", "News summary (pick hours)"),
             ("digest", "Get held-back items now"), ("ask", "Ask the AI about any headline"),
             ("settings", "Change your limits with ➕ / ➖ buttons"), ("learn", "How past signals played out"),
             ("status", "Health check")]
     PANEL = [["✅ High certainty", "⭐ Portfolio", "🗞️ Brief"], ["🎯 Top", "🤖 Ask AI", "📥 Digest"],
-             ["⚙️ Settings", "📊 Learn", "☰ More"]]
-    PANEL_MAP = {"✅ High certainty": "/sure", "🎯 Top": "/top", "🗞️ Brief": "/brief", "⭐ Portfolio": "/portfolio", "🤖 Ask AI": "/ask",
+             ["⚙️ Settings", "🏆 Track record", "☰ More"]]
+    PANEL_MAP = {"🏆 Track record": "/track", "✅ High certainty": "/sure", "🎯 Top": "/top", "🗞️ Brief": "/brief", "⭐ Portfolio": "/portfolio", "🤖 Ask AI": "/ask",
                  "⚙️ Settings": "/settings", "📥 Digest": "/digest", "📊 Learn": "/learn",
                  "🩺 Status": "/status", "☰ More": "/more"}
     STEPS = {  # setting -> (button label, step, min, max)
@@ -1286,7 +1475,7 @@ class Radar:
         """Stocks where the evidence clearly points one way: most signals agree, the combined
         weight is large, and either the evidence score or the AI's confidence is high.
         No count limit: it can be 0 stocks or 20."""
-        muted = u.muted()
+        muted = u.muted() if u else set()
         syms = {e["symbol"] for e in self.store.events_since(time.time() - hours * 3600)
                 if e["symbol"] and e["symbol"] not in muted}
         out = []
@@ -1312,7 +1501,8 @@ class Radar:
                      "Nothing right now. A stock appears here only when most of the last 24h's signals point "
                      "the same way and the evidence is strong."], [])
         lines = [f"✅ <b>High certainty</b> · {len(items)} stock{'s' if len(items) != 1 else ''} (last 24h)",
-                 "<i>Most signals agree and the evidence is strong. Strong evidence, not a guarantee.</i>"]
+                 "<i>Most signals agree and the evidence is strong. Strong evidence, not a guarantee. "
+                 "📌 Every call here is recorded and judged at the next close → 🏆 Track record.</i>"]
         for it in items:
             s, o = it["symbol"], it["o"]
             arrow = "🟢 ↑" if o["sign"] > 0 else "🔴 ↓"
@@ -1467,6 +1657,12 @@ class Radar:
             self.store.watch_remove(rest, u.chat)
             self.rebuild_matcher()
             toast = f"Removed {rest} from your portfolio"
+        elif kind == "track":
+            lines, rows = self.track_view(rest)
+            if isinstance(lines, str):
+                u.send(lines)
+            else:
+                u.send_long(lines)
         elif kind == "brief":
             u.send_long(self.brief(now() - timedelta(hours=float(rest)), f"News brief · last {rest}h", user=u))
         elif kind == "prompt":
@@ -1590,6 +1786,12 @@ class Radar:
             u.send(f"🤖 AI reasoning: {self.ai.provider or 'off'}\n"
                    f"Headlines read today (everyone): {self.ai.calls_today}/{self.ai.max_per_day}"
                    + (f"\nRecent errors: {self.ai.errors}\n<code>{esc(self.ai.last_error)}</code>" if self.ai.errors else ""))
+        elif cmd == "/track":
+            lines, rows = self.track_view("summary")
+            if isinstance(lines, str):
+                return u.send(lines)
+            u.send_long(lines)
+            u.send("More:", buttons=rows)
         elif cmd == "/learn":
             self.cmd_learn(u)
         elif cmd == "/settings":
@@ -1695,7 +1897,7 @@ class Radar:
                            reply_keyboard=self.PANEL)
         self.owner.send(f"🛰️ Stock Radar online · {n} {'person' if n == 1 else 'people'} using it · "
                         f"your portfolio: {len(self.owner.portfolio())} stocks.", reply_keyboard=self.PANEL)
-        nxt = dict.fromkeys(["filings", "results", "prices", "cmds", "news", "insider", "deals", "outcomes", "channels"], 0)
+        nxt = dict.fromkeys(["filings", "results", "prices", "cmds", "news", "insider", "deals", "outcomes", "channels", "certainty", "evaluate"], 0)
         last_universe = last_prune = now().date()
         retry_universe = 0
         while True:
@@ -1723,6 +1925,10 @@ class Radar:
                 self.poll_prices()
             if market_open(t) and due("outcomes", 300):
                 self.poll_outcomes()
+            if due("certainty", 900):
+                self.scan_certainty()
+            if is_weekday(t) and "15:40" <= f"{t.hour:02d}:{t.minute:02d}" < "18:00" and due("evaluate", 600):
+                self.evaluate_predictions()
             if self.channel_list() and due("channels", 60):
                 self.poll_channels()
             if due("cmds", config.TELEGRAM_POLL):
