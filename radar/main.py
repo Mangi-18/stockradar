@@ -886,6 +886,24 @@ class Radar:
                                   if test is not None else
                                   f"⚠️ Key saved but the test call failed:\n<code>{esc(self.ai.last_error)}</code>")
                                  + "\nPlease delete your message that contains the key.")
+            elif cmd == "/ask" and len(parts) >= 2:
+                q = text.split(None, 1)[1]
+                if not self.ai.provider:
+                    self.tg.send("AI is off. Send /setkey YOUR_KEY first.")
+                    continue
+                r = self.ai.read(q, "you", sorted(self.portfolio()))
+                if r is None:
+                    self.tg.send(f"⚠️ AI call failed: <code>{esc(self.ai.last_error)}</code>")
+                elif not r["impacts"]:
+                    self.tg.send("🤖 No clear effect on any listed stock" + (" (already priced in)." if r["priced_in"] else "."))
+                else:
+                    out = ["🤖 <b>Likely impact</b>" + (" · already priced in" if r["priced_in"] else "")]
+                    for i in r["impacts"]:
+                        star = "⭐ " if i["symbol"] in self.portfolio() else ""
+                        out.append(f"{'🟢 ↑' if i['direction'] == 'up' else '🔴 ↓'} {star}<b>{esc(i['symbol'])}</b> "
+                                   f"{i['magnitude']} ({i['confidence']:.0%}, {esc(i['order'])})\n   {esc(i['why'])}")
+                    out.append("<i>An AI reading of the headline, not a prediction. Check the price before acting.</i>")
+                    self.tg.send("\n".join(out))
             elif cmd == "/ai":
                 self.ai.budget_left()
                 self.tg.send(f"🤖 AI reasoning: {self.ai.provider or 'off (send /setkey YOUR_KEY)'}\n"
@@ -922,7 +940,7 @@ class Radar:
                              "/mute SYM — never alert this stock\n/unmute SYM\n"
                              "/top — strongest candidates right now\n/brief [hours] — news summary\n"
                              "/digest — send held-back items now\n/settings — see limits\n/set NAME VALUE — change a limit (e.g. /set maxopp 15)\n"
-                             "/update — install the latest version\n/setkey KEY — turn on AI reasoning\n/ai — AI status\n"
+                             "/update — install the latest version\n/setkey KEY — turn on AI reasoning\n/ask HEADLINE — AI reads any news for you\n/ai — AI status\n"
                              "/learn — how past signals actually played out\n/status")
 
     # ================================================================== health

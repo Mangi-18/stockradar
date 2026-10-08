@@ -120,6 +120,7 @@ You'll get "🛰️ Stock Radar online" in Telegram.
 - `/settings` — see all limits; `/set maxopp 15`, `/set score 60`, `/set cooldown 0`, `/set quiet off` change them instantly (no server login needed)
 - `/update` — install the latest version from GitHub and restart (after the one-time setup below)
 - `/setkey YOUR_KEY` — turn on AI reasoning (free key from aistudio.google.com/apikey or console.groq.com/keys); `/ai` shows its status
+- `/ask HEADLINE` — paste any news headline; the AI tells you which stocks it likely moves, which way and why
 - `/learn` — how each kind of signal actually played out so far
 
 ## One-time setup for one-tap updates

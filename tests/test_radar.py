@@ -360,6 +360,17 @@ def test_learning_stats_and_feedback():
     assert adj == 10 and "75%" in why
 
 
+def test_ask_command():
+    r = make_radar(["ONGC"])
+    r.ai.key = "AQ.test"
+    r.ai.read = lambda q, src, port: {"relevant": True, "priced_in": False, "impacts": [
+        {"symbol": "ONGC", "direction": "down", "magnitude": "medium", "confidence": 0.7,
+         "order": "direct", "why": "lower crude cuts realisations"}]}
+    r.tg.commands = lambda: ["/ask Crude falls 6% after OPEC raises output"]
+    r.handle_commands()
+    assert "ONGC" in r.sent[-1] and "↓" in r.sent[-1] and "⭐" in r.sent[-1]
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
