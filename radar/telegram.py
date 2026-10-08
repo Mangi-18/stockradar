@@ -32,13 +32,13 @@ class Telegram:
             log.warning("%s error: %s", method, e)
             return None
 
-    def send(self, html: str, buttons=None, reply_keyboard=None) -> bool:
+    def send(self, html: str, buttons=None, reply_keyboard=None, chat=None) -> bool:
         """buttons: inline buttons under the message, [[(label, data), ...], ...].
         reply_keyboard: the always-visible button panel above the typing box, [[label, ...], ...]."""
         if not self.enabled:
             print("[telegram disabled]\n" + html + "\n")
             return False
-        payload = {"chat_id": self.chat_id, "text": html[:4000], "parse_mode": "HTML",
+        payload = {"chat_id": str(chat or self.chat_id), "text": html[:4000], "parse_mode": "HTML",
                    "disable_web_page_preview": True}
         if buttons:
             payload["reply_markup"] = keyboard(buttons)
@@ -48,8 +48,8 @@ class Telegram:
         r = self._post("sendMessage", payload)
         return bool(r is not None and r.ok)
 
-    def edit(self, message_id: int, html: str, buttons=None) -> None:
-        payload = {"chat_id": self.chat_id, "message_id": message_id, "text": html[:4000],
+    def edit(self, message_id: int, html: str, buttons=None, chat=None) -> None:
+        payload = {"chat_id": str(chat or self.chat_id), "message_id": message_id, "text": html[:4000],
                    "parse_mode": "HTML", "disable_web_page_preview": True}
         if buttons:
             payload["reply_markup"] = keyboard(buttons)
@@ -62,22 +62,22 @@ class Telegram:
     def set_menu(self, commands) -> None:
         """The ☰ Menu button next to the typing box: a list of commands with descriptions."""
         self._post("setMyCommands", {"commands": [{"command": c, "description": d[:256]} for c, d in commands]})
-        self._post("setChatMenuButton", {"chat_id": self.chat_id, "menu_button": {"type": "commands"}})
+        self._post("setChatMenuButton", {"menu_button": {"type": "commands"}})  # default for every chat
 
-    def send_long(self, lines: list) -> None:
+    def send_long(self, lines: list, chat=None) -> None:
         """Send a long message as several Telegram messages (limit ~4,000 characters each)."""
         chunk = ""
         for ln in lines:
             if len(chunk) + len(ln) + 1 > 3800:
-                self.send(chunk)
+                self.send(chunk, chat=chat)
                 chunk = ""
             chunk += ln + "\n"
         if chunk.strip():
-            self.send(chunk)
+            self.send(chunk, chat=chat)
 
     def commands(self) -> list:
-        """New things from YOUR chat only: {"type": "text", "text"} for typed messages and
-        {"type": "tap", "data", "id", "msg_id"} for tapped buttons. Others are ignored."""
+        """New things from any private chat: {"type": "text", "text", "chat", "name"} for typed
+        messages and {"type": "tap", "data", "id", "msg_id", "chat", "name"} for tapped buttons."""
         if not self.enabled:
             return []
         try:
@@ -88,14 +88,24 @@ class Telegram:
             for u in r.json().get("result", []):
                 self.offset = u["update_id"] + 1
                 cb = u.get("callback_query")
-                if cb and str(cb.get("message", {}).get("chat", {}).get("id")) == self.chat_id:
-                    out.append({"type": "tap", "data": cb.get("data", ""), "id": cb["id"],
-                                "msg_id": cb["message"]["message_id"]})
+                if cb and cb.get("message"):
+                    chat = cb["message"]["chat"]
+                    if chat.get("type") == "private":
+                        out.append({"type": "tap", "data": cb.get("data", ""), "id": cb["id"],
+                                    "msg_id": cb["message"]["message_id"], "chat": str(chat["id"]),
+                                    "name": _name(cb.get("from") or {})})
                     continue
                 msg = u.get("message") or {}
-                if str(msg.get("chat", {}).get("id")) == self.chat_id and msg.get("text"):
-                    out.append({"type": "text", "text": msg["text"].strip()})
+                chat = msg.get("chat") or {}
+                if chat.get("type") == "private" and msg.get("text"):
+                    out.append({"type": "text", "text": msg["text"].strip(), "chat": str(chat["id"]),
+                                "name": _name(msg.get("from") or {})})
             return out
         except (requests.RequestException, ValueError, KeyError) as e:
             log.warning("getUpdates error: %s", e)
             return []
+
+
+def _name(user: dict) -> str:
+    n = " ".join(x for x in (user.get("first_name"), user.get("last_name")) if x)
+    return n + (f" (@{user['username']})" if user.get("username") else "") or "someone"

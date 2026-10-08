@@ -7,6 +7,7 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ["DB_PATH"] = os.path.join(tempfile.mkdtemp(), "t.db")
 os.environ["TELEGRAM_BOT_TOKEN"] = ""
+os.environ["TELEGRAM_CHAT_ID"] = "1"     # the owner
 os.environ["QUIET_START"] = "0"   # no quiet hours in tests
 os.environ["QUIET_END"] = "0"
 
@@ -82,13 +83,14 @@ def make_radar(portfolio=()):
     M.config.DB_PATH = os.path.join(tempfile.mkdtemp(), "t.db")  # fresh state per test
     r = M.Radar()
     r.sent = []
-    r.tg.send = lambda m, *a, **k: r.sent.append(m) or True
+    r.sent_to = []
+    r.tg.send = lambda m, *a, **k: (r.sent.append(m), r.sent_to.append(str(k.get("chat") or "1")))[0] or True
+    r.tg.send_long = lambda lines, chat=None: (r.sent.append("\n".join(lines)), r.sent_to.append(str(chat or "1")))
     r.buttons = []
-    r.tg.edit = lambda mid, m, b=None: r.sent.append(m)
+    r.tg.edit = lambda mid, m, b=None, chat=None: r.sent.append(m)
     r.tg.answer = lambda cid, text="": r.sent.append("toast:" + text)
-    r.tg.send_long = lambda lines: r.sent.append("\n".join(lines))
     for p in portfolio:
-        r.store.watch_add(p)
+        r.store.watch_add(p, "1")
     r.rebuild_matcher()
     return r
 
@@ -166,7 +168,7 @@ def test_opportunity_needs_agreement_and_respects_cap():
         r.handle_headline("Zen Technologies wins defence contract", "BS", "")
         r.handle_headline("Zen Technologies receives anti-drone contract", "Mint", "")
         assert len([m for m in r.sent if "Opportunity" in m]) == 1  # cap reached: ZENTEC goes to digest
-        assert any("ZENTEC" in q[2] for q in r.store.take_queue())
+        assert any("ZENTEC" in q[2] for q in r.store.take_queue("1"))
     finally:
         M.config.OPP_MAX_PER_DAY = old
 
@@ -287,17 +289,14 @@ def test_market_matcher():
     assert split_source("Senco Gold posts record revenue - Moneycontrol", "g") == ("Senco Gold posts record revenue", "Moneycontrol")
 
 
-def test_settings_commands_persist():
+def test_settings_are_per_person_and_persist():
     r = make_radar()
-    assert "maxopp = 15" in r.set_setting("maxopp", "15")
-    assert M.config.OPP_MAX_PER_DAY == 15
-    r.set_setting("quiet", "off")
-    assert M.config.QUIET_START == M.config.QUIET_END
-    r2 = M.Radar.__new__(M.Radar); r2.store = r.store; M.config.OPP_MAX_PER_DAY = 5
-    r2.apply_saved_settings()
-    assert M.config.OPP_MAX_PER_DAY == 15  # survives a restart
-    assert "Unknown" in r.set_setting("nonsense", "1")
-    M.config.OPP_MAX_PER_DAY = 5; M.config.QUIET_START = M.config.QUIET_END = 0
+    assert "maxopp = 15" in r.set_setting("maxopp", "15", "1")
+    assert r.owner.cfg("maxopp") == 15
+    assert r.user("2").cfg("maxopp") == M.config.OPP_MAX_PER_DAY   # someone else keeps the default
+    r.set_setting("quiet", "off", "1")
+    assert r.owner.quiet_range()[0] == r.owner.quiet_range()[1]
+    assert "Unknown" in r.set_setting("nonsense", "1", "1")
 
 
 # ---------------------------------------------------------------- AI reasoning + learning
@@ -452,17 +451,16 @@ def test_breaking_from_exchange_filing():
 def test_buttons_settings_portfolio_and_alert_actions():
     r = make_radar(["TCS"])
     sent_buttons = []
-    r.tg.send = lambda m, buttons=None, reply_keyboard=None: (r.sent.append(m), sent_buttons.append(buttons or reply_keyboard))
+    r.tg.send = lambda m, buttons=None, reply_keyboard=None, chat=None: (r.sent.append(m), sent_buttons.append(buttons or reply_keyboard))
     # panel button text maps to a command
     r.tg.commands = lambda: [{"type": "text", "text": "⚙️ Settings"}]
     r.handle_commands()
-    assert "Settings" in r.sent[-1] and any("Opportunities/day" in b[1][0] for b in sent_buttons[-1] if len(b) == 3)
+    assert "settings" in r.sent[-1] and any("Opportunities/day" in b[1][0] for b in sent_buttons[-1] if len(b) == 3)
     # tap ➕ on max opportunities
-    before = M.config.OPP_MAX_PER_DAY
+    before = r.owner.cfg("maxopp")
     r.tg.commands = lambda: [{"type": "tap", "data": "set:maxopp:+", "id": "1", "msg_id": 5}]
     r.handle_commands()
-    assert M.config.OPP_MAX_PER_DAY == before + 1
-    M.config.OPP_MAX_PER_DAY = before
+    assert r.owner.cfg("maxopp") == before + 1
     # add via prompt then typed symbols
     r.tg.commands = lambda: [{"type": "tap", "data": "prompt:add", "id": "2", "msg_id": 6},
                              {"type": "text", "text": "hal irfc"}]
@@ -476,7 +474,7 @@ def test_buttons_settings_portfolio_and_alert_actions():
     r.tg.commands = lambda: [{"type": "tap", "data": "add:ZENTEC", "id": "4", "msg_id": 8},
                              {"type": "tap", "data": "mute:GPIL", "id": "5", "msg_id": 9}]
     r.handle_commands()
-    assert "ZENTEC" in r.portfolio() and "GPIL" in r.store.muted()
+    assert "ZENTEC" in r.portfolio() and "GPIL" in r.store.muted("1")
 
 
 def test_pasted_headline_goes_to_ai():
@@ -488,6 +486,77 @@ def test_pasted_headline_goes_to_ai():
     r.tg.commands = lambda: [{"type": "text", "text": "Crude falls 6% after OPEC raises output"}]
     r.handle_commands()
     assert "ONGC" in r.sent[-1]
+
+
+# ---------------------------------------------------------------- family / multi-user
+def test_new_person_gets_own_space_and_owner_is_told():
+    r = make_radar(["TCS"])
+    r.tg.commands = lambda: [{"type": "text", "text": "/start", "chat": "2", "name": "Mom"}]
+    r.handle_commands()
+    assert r.store.user_status("2") == "active"
+    assert any("Welcome" in m for m, c in zip(r.sent, r.sent_to) if c == "2")
+    assert any("Mom" in m and "started using" in m for m, c in zip(r.sent, r.sent_to) if c == "1")
+    # Mom adds her own stock; owner's portfolio unchanged
+    r.tg.commands = lambda: [{"type": "text", "text": "/add hal", "chat": "2", "name": "Mom"}]
+    r.handle_commands()
+    assert r.user("2").portfolio() == {"HAL"} and r.owner.portfolio() == {"TCS"}
+
+
+def test_alerts_go_only_to_holders():
+    r = make_radar(["TCS"])
+    r.store.user_add("2", "Mom"); r.store.watch_add("HAL", "2")
+    r.names.update({"HAL": "Hindustan Aeronautics", "TCS": "Tata Consultancy Services"})
+    r.rebuild_matcher()
+    r.sent.clear(); r.sent_to.clear()
+    r.handle_headline("HAL bags Rs 62,000 crore order", "BS", "")
+    hal = [c for m, c in zip(r.sent, r.sent_to) if "⭐ HAL" in m]
+    assert hal == ["2"], (r.sent, r.sent_to)
+    r.handle_headline("TCS wins $2 bn deal from European bank", "ET", "")
+    tcs = [c for m, c in zip(r.sent, r.sent_to) if "⭐ TCS" in m]
+    assert tcs == ["1"]
+
+
+def test_market_alert_reaches_every_non_holder_with_their_own_cap():
+    r = make_radar()
+    r.store.user_add("2", "Dad")
+    r.set_setting("maxbreak", "0", "2")              # Dad doesn't want breaking alerts
+    r.market_matcher = build_market_matcher({"ZENTEC": "Zen Technologies"})
+    r.names["ZENTEC"] = "Zen Technologies"
+    r.ai.key = "AQ.test"
+    r.ai.read = lambda h, src, port: {"relevant": True, "priced_in": False, "impacts": [
+        {"symbol": "ZENTEC", "direction": "up", "magnitude": "large", "confidence": 0.9,
+         "order": "direct", "why": "big order"}]}
+    r.handle_headline("Zen Technologies bags Rs 1,200 crore defence order", "ET", "")
+    brk = [c for m, c in zip(r.sent, r.sent_to) if "BREAKING" in m]
+    assert brk == ["1"]
+    assert any("ZENTEC" in q[2] for q in r.store.take_queue("2"))  # Dad gets it in his digest instead
+
+
+def test_owner_only_actions_and_removing_people():
+    r = make_radar()
+    r.store.user_add("2", "Cousin")
+    r.tg.commands = lambda: [{"type": "text", "text": "/update", "chat": "2", "name": "Cousin"}]
+    r.handle_commands()
+    assert "Only the bot's owner" in r.sent[-1]
+    r.tg.commands = lambda: [{"type": "tap", "data": "kick:2", "id": "9", "msg_id": 3, "chat": "1"}]
+    r.handle_commands()
+    assert r.store.user_status("2") == "removed"
+    n = len(r.sent)
+    r.tg.commands = lambda: [{"type": "text", "text": "⭐ Portfolio", "chat": "2", "name": "Cousin"}]
+    r.handle_commands()
+    assert len(r.sent) == n                           # removed people are ignored
+
+
+def test_old_single_user_data_moves_to_owner():
+    import sqlite3
+    path = os.path.join(tempfile.mkdtemp(), "old.db")
+    db = sqlite3.connect(path)
+    db.executescript("CREATE TABLE watch (symbol TEXT PRIMARY KEY); INSERT INTO watch VALUES ('LICI');"
+                     "CREATE TABLE kv (k TEXT PRIMARY KEY, v TEXT); INSERT INTO kv VALUES ('cfg:maxopp', '12');")
+    db.commit(); db.close()
+    M.config.DB_PATH = path
+    r = M.Radar()
+    assert "LICI" in r.owner.portfolio() and r.owner.cfg("maxopp") == 12
 
 
 if __name__ == "__main__":

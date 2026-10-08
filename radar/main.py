@@ -1,12 +1,12 @@
-"""Stock Radar engine.
+"""Stock Radar engine (family edition).
 
-Two lists, two rules:
-  * YOUR PORTFOLIO: every relevant filing, news item, deal or price burst reaches you
-    (routine items are rate-limited per stock; urgent ones always go through).
-  * THE REST OF THE MARKET (~2,000 stocks): watched silently. A stock pings you only
-    when independent signals agree strongly enough (opportunity score >= 70/100),
-    and never more than OPP_MAX_PER_DAY times a day. Weaker candidates go into a
-    digest 3 times a day and the 8:30am brief.
+The market is scanned ONCE for everyone; alerts are delivered PER PERSON:
+  * Each person's PORTFOLIO: every relevant filing, news item, deal or price burst
+    reaches them (routine items rate-limited per stock; urgent ones always go).
+  * The rest of the market (~2,000 stocks): watched silently. A stock reaches a person
+    only as ⚡ Breaking, 🎯 Opportunity or 📣 Story, within that person's own limits.
+Anyone who presses Start on the bot gets their own portfolio and settings. The owner
+(TELEGRAM_CHAT_ID in .env) can also update the engine, set the AI key and manage users.
 
 Run:  python -m radar.main
 """
@@ -52,9 +52,8 @@ def busy_hours(t: datetime) -> bool:
     return is_weekday(t) and 7 <= t.hour < 22
 
 
-def quiet_hours(t: datetime) -> bool:
-    s, e = config.QUIET_START, config.QUIET_END
-    return (t.hour >= s or t.hour < e) if s > e else (s <= t.hour < e)
+def in_quiet(t: datetime, start: int, end: int) -> bool:
+    return (t.hour >= start or t.hour < end) if start > end else (start <= t.hour < end)
 
 
 def esc(s) -> str:
@@ -83,24 +82,87 @@ def event_label(e: dict) -> str:
     return classify(h)["label"]
 
 
+# Per-person settings: name -> (config attribute holding the default, type, description)
+SETTINGS = {
+    "maxopp": ("OPP_MAX_PER_DAY", int, "max opportunity alerts per day"),
+    "score": ("OPP_MIN_SCORE", float, "evidence score (0-100) needed to ping you"),
+    "digestscore": ("OPP_DIGEST_SCORE", float, "score needed to appear in digests"),
+    "cooldown": ("STOCK_COOLDOWN_MIN", float, "minutes between routine pings per portfolio stock (0 = off)"),
+    "gap": ("PREOPEN_MIN_GAP", float, "% pre-open gap for your stocks"),
+    "outlets": ("STORY_MIN_OUTLETS", int, "outlets covering a stock before a 📣 story alert"),
+    "maxstory": ("STORY_MAX_PER_DAY", int, "max 📣 story alerts per day"),
+    "breakconf": ("BREAKING_MIN_CONF", float, "AI confidence (0-1) needed for a ⚡ breaking alert"),
+    "maxbreak": ("BREAKING_MAX_PER_DAY", int, "max ⚡ breaking alerts per day"),
+}
+
+
+class User:
+    """One person using the bot: their own portfolio, mutes, settings, digest and chat."""
+
+    def __init__(self, radar, chat: str, name: str = ""):
+        self.r, self.chat, self.name = radar, str(chat), name
+
+    @property
+    def is_owner(self) -> bool:
+        return self.chat == str(config.TELEGRAM_CHAT_ID)
+
+    def portfolio(self) -> set:
+        extra = set(config.EXTRA_WATCHLIST) if self.is_owner else set()
+        return extra | set(self.r.store.watchlist(self.chat))
+
+    def muted(self) -> set:
+        return self.r.store.muted(self.chat)
+
+    def cfg(self, name: str):
+        attr, typ, _ = SETTINGS[name]
+        v = self.r.store.get(f"cfg:{self.chat}:{name}")
+        return typ(float(v)) if v is not None else getattr(config, attr)
+
+    def quiet_range(self):
+        q = self.r.store.get(f"cfg:{self.chat}:quiet")
+        if q:
+            return (0, 0) if q == "off" else tuple(map(int, q.split("-")))
+        return config.QUIET_START, config.QUIET_END
+
+    def quiet(self, t: datetime = None) -> bool:
+        s, e = self.quiet_range()
+        return in_quiet(t or now(), s, e)
+
+    def send(self, text, buttons=None, reply_keyboard=None):
+        return self.r.tg.send(text, buttons=buttons, reply_keyboard=reply_keyboard, chat=self.chat)
+
+    def send_long(self, lines):
+        self.r.tg.send_long(lines, chat=self.chat)
+
+    def queue(self, sym, text, score):
+        self.r.store.queue(sym, text, score, chat=self.chat)
+
+    def key(self, prefix: str, day: str, sym: str) -> str:
+        return f"{prefix}:{day}:{self.chat}:{sym}"
+
+    def count(self, prefix: str, day: str) -> int:
+        return self.r.store.count_today(prefix, f"{day}:{self.chat}")
+
+
 class Radar:
     def __init__(self):
         self.store = Store(config.DB_PATH)
         self.tg = Telegram(config.TELEGRAM_BOT_TOKEN, config.TELEGRAM_CHAT_ID)
         self.nse = NSE()
         self.bse = BSE() if config.USE_BSE else None
-        self.universe = set()        # index stocks we scan for prices (not alerted by default)
+        self.universe = set()        # index stocks we scan for prices
         self.failures = {}
         self.last_error = {}
         self.last_price = {}         # symbol -> latest price seen (for outcome tracking)
         self.stats, self._stats_at = {}, 0.0
         self._ai_cycle = 0
         self._ai_filing_cycle = 0
-        self.awaiting = None         # what the next typed message means ("add", "ask", "setkey")
+        self._story_ai = {}          # (day, symbol) -> AI reading used for 📣 story alerts
+        self.awaiting = {}           # chat -> what their next typed message means
         self.result_tries = {}
         self.warmed_up = set()
         self.names = {}              # symbol -> company name
-        self.matcher = []            # portfolio + index stocks (aliases, symbols)
+        self.matcher = []            # everyone's portfolio + index stocks (aliases, symbols)
         self.market_matcher = []     # every other NSE company, by full name
         self.day_change = {}         # symbol -> today's % change (to spot 'already moved')
         self.momentum = Momentum(config.MOMENTUM_WINDOW_MIN * 60, config.MOMENTUM_MOVE,
@@ -108,17 +170,43 @@ class Radar:
         self.news = NewsFeeds(config.NEWS_FEEDS or DEFAULT_FEEDS)
         if self.store.get("initialized"):
             self.warmed_up = {"nse", "bse", "results", "insider", "deals"}
-        self.apply_saved_settings()
+        owner = str(config.TELEGRAM_CHAT_ID or "")
+        if owner:
+            self.store.user_add(owner, "owner")
+            self.store.migrate_single_user(owner)
         self.ai = AIReader(self.store.get("ai_key") or config.AI_KEY, config.AI_MAX_PER_DAY)
         self.ai.model = config.AI_MODEL
 
-    # ================================================================== lists
+    # ================================================================== people
+    def users(self) -> list:
+        return [User(self, c, n) for c, n in self.store.users("active")]
+
+    def user(self, chat: str) -> User:
+        return User(self, chat)
+
+    @property
+    def owner(self) -> User:
+        return User(self, str(config.TELEGRAM_CHAT_ID))
+
     def portfolio(self) -> set:
-        return set(config.EXTRA_WATCHLIST) | set(self.store.watchlist())
+        """Everyone's portfolios combined (for matching news and fetching prices)."""
+        out = set()
+        for u in self.users():
+            out |= u.portfolio()
+        return out
 
-    def watched(self) -> set:  # kept for older callers
-        return self.portfolio()
+    def holders(self, sym: str) -> list:
+        return [u for u in self.users() if sym in u.portfolio() and sym not in u.muted()]
 
+    def outsiders(self, sym: str) -> list:
+        """People who don't hold this stock and haven't muted it (candidates for market alerts)."""
+        return [u for u in self.users() if sym not in u.portfolio() and sym not in u.muted()]
+
+    def broadcast(self, text: str, buttons=None) -> None:
+        for u in self.users():
+            u.send(text, buttons=buttons)
+
+    # ================================================================== lists
     def refresh_universe(self) -> None:
         syms = set()
         err = None
@@ -151,47 +239,54 @@ class Radar:
 
     # ================================================================== routing
     def notify(self, sym: str, text: str, urgent: bool = False) -> None:
-        """Portfolio alerts. Urgent ones always go out. Routine ones respect quiet
-        hours and a per-stock cooldown; held-back items go into the next digest."""
-        if sym in self.store.muted():
-            return
-        t = now()
-        if not urgent:
-            cooling = False
-            if config.STOCK_COOLDOWN_MIN > 0:  # 0 = no cooldown, every item goes out
-                slot = int(time.time() // (config.STOCK_COOLDOWN_MIN * 60))
-                cooling = not self.store.first_time(f"cool:{sym}:{slot}")
-            if quiet_hours(t) or cooling:
-                self.store.queue(sym, text, 50)
-                return
-        self.tg.send(text)
+        """Portfolio alerts, to everyone who holds the stock. Urgent ones always go out;
+        routine ones respect each person's quiet hours and per-stock cooldown."""
+        for u in self.holders(sym):
+            if not urgent:
+                cooling = False
+                cd = u.cfg("cooldown")
+                if cd > 0:  # 0 = no cooldown
+                    slot = int(time.time() // (cd * 60))
+                    cooling = not self.store.first_time(f"cool:{u.chat}:{sym}:{slot}")
+                if u.quiet() or cooling:
+                    u.queue(sym, text, 50)
+                    continue
+            u.send(text)
 
-    def consider(self, sym: str) -> None:
-        """A stock outside your portfolio just produced a signal. Score all its
-        evidence from the last 24 h and decide: ping, digest, or stay silent."""
-        if not sym or sym in self.portfolio() or sym in self.store.muted():
-            return
+    def scored(self, sym: str) -> dict:
         evs = self.store.events_for(sym, 24)
         s = score_events(evs, self.day_change.get(sym))
         adj, why = self.learned_adjust(evs)
         if adj:
             s["score"] = max(0, min(100, s["score"] + adj))
             s["reasons"].append(why)
-        day = now().strftime("%Y-%m-%d")
-        if s["score"] >= config.OPP_MIN_SCORE and not quiet_hours(now()):
-            used = self.store.count_today("opp", day)
-            if (used < config.OPP_MAX_PER_DAY and not self.store.has_seen(f"story:{day}:{sym}:sent")
-                    and not self.store.has_seen(f"brk:{day}:{sym}")
-                    and self.store.first_time(f"opp:{day}:{sym}")):
-                self.tg.send(self.format_opportunity(sym, s, used + 1), buttons=self.stock_buttons(sym))
-                return
-        if s["score"] >= config.OPP_DIGEST_SCORE and self.store.first_time(f"oppq:{day}:{sym}"):
-            self.store.queue(sym, self.format_candidate(sym, s), s["score"])
+        return s
 
-    def format_opportunity(self, sym, s, n) -> str:
+    def consider(self, sym: str) -> None:
+        """A stock produced a signal. Score its evidence once, then decide per person
+        (who doesn't hold it): ping, digest, or stay silent."""
+        if not sym:
+            return
+        people = self.outsiders(sym)
+        if not people:
+            return
+        s = self.scored(sym)
+        day = now().strftime("%Y-%m-%d")
+        for u in people:
+            if s["score"] >= u.cfg("score") and not u.quiet():
+                used = u.count("opp", day)
+                if (used < u.cfg("maxopp") and not self.store.has_seen(u.key("story", day, sym))
+                        and not self.store.has_seen(u.key("brk", day, sym))
+                        and self.store.first_time(u.key("opp", day, sym))):
+                    u.send(self.format_opportunity(sym, s, used + 1, u.cfg("maxopp")), buttons=self.stock_buttons(sym))
+                    continue
+            if s["score"] >= u.cfg("digestscore") and self.store.first_time(u.key("oppq", day, sym)):
+                u.queue(sym, self.format_candidate(sym, s), s["score"])
+
+    def format_opportunity(self, sym, s, n, cap) -> str:
         ev = self.store.events_for(sym, 24)[-3:]
         lines = [f"🎯 <b>Opportunity · {esc(sym)}</b> {ARROW[s['direction']]}",
-                 f"Evidence score <b>{s['score']:.0f}/100</b> · alert {n} of {config.OPP_MAX_PER_DAY} today",
+                 f"Evidence score <b>{s['score']:.0f}/100</b> · alert {n} of {cap} today",
                  *[f"   {esc(r)}" for r in s["reasons"]],
                  "<b>Latest evidence</b>",
                  *[f"• {TONE.get(e['tone'], '🟡')} {esc(e['headline'][:150])} <i>({esc(e['source'] or e['kind'])})</i>"
@@ -254,7 +349,7 @@ class Radar:
             self.store.track(sym, "filing", c["label"], 1 if c["tone"] == "+" else -1)
         if silent or c["impact"] not in (HIGH, MEDIUM):
             return
-        if sym in self.portfolio():
+        if self.holders(sym):
             msg = (f"{TONE[c['tone']]} <b>⭐ {esc(sym)}</b> · {esc(c['label'])}\n{esc(it['headline'][:600])}\n"
                    f"<i>{it['exchange']} filing · {now().strftime('%H:%M:%S')}</i>")
             if it["url"]:
@@ -262,23 +357,24 @@ class Radar:
             if c["label"] == "Quarterly results":
                 msg += "\n⏳ Numbers follow as soon as NSE publishes them."
             self.notify(sym, msg, urgent=c["impact"] == HIGH)
-        elif c["label"] != "Quarterly results":  # others' results are judged on the numbers
-            if c["impact"] == HIGH and self.ai.provider and self._ai_filing_cycle < 6:
-                # An exchange filing is the earliest public source. Ask the AI how big it is
-                # for THIS company (a ₹500 cr order is huge for a small cap, nothing for L&T).
-                self._ai_filing_cycle += 1
-                r = self.ai.read(f"{it.get('company') or sym} (NSE: {sym}) exchange filing — {c['label']}: "
-                                 f"{it['headline'][:400]}", f"{it['exchange']} filing", sorted(self.portfolio()))
-                i = next((x for x in (r or {}).get("impacts", []) if x["symbol"] == sym), None)
-                if i and i["confidence"] >= 0.5:
-                    up = i["direction"] == "up"
-                    strong = i["magnitude"] == "large" and i["confidence"] >= 0.7
-                    self.store.log_event(sym, "ai", f"AI: {'↑' if up else '↓'} {i['magnitude']} ({i['confidence']:.0%}) — "
-                                         f"{i['why']}", "+" if up else "-", HIGH if strong else MEDIUM, it["exchange"], it["url"])
-                    self.store.track(sym, "ai", f"AI {i['magnitude']}", 1 if up else -1)
-                    if not (r or {}).get("priced_in"):
-                        self.breaking_check(i, f"{c['label']}: {it['headline'][:300]}", f"{it['exchange']} filing", it["url"])
-            self.consider(sym)
+        if c["label"] == "Quarterly results":  # others' results are judged on the numbers
+            return
+        if c["impact"] == HIGH and self.ai.provider and self._ai_filing_cycle < 6 and self.outsiders(sym):
+            # An exchange filing is the earliest public source. Ask the AI how big it is
+            # for THIS company (a ₹500 cr order is huge for a small cap, nothing for L&T).
+            self._ai_filing_cycle += 1
+            r = self.ai.read(f"{it.get('company') or sym} (NSE: {sym}) exchange filing — {c['label']}: "
+                             f"{it['headline'][:400]}", f"{it['exchange']} filing", sorted(self.portfolio()))
+            i = next((x for x in (r or {}).get("impacts", []) if x["symbol"] == sym), None)
+            if i and i["confidence"] >= 0.5:
+                up = i["direction"] == "up"
+                strong = i["magnitude"] == "large" and i["confidence"] >= 0.7
+                self.store.log_event(sym, "ai", f"AI: {'↑' if up else '↓'} {i['magnitude']} ({i['confidence']:.0%}) — "
+                                     f"{i['why']}", "+" if up else "-", HIGH if strong else MEDIUM, it["exchange"], it["url"])
+                self.store.track(sym, "ai", f"AI {i['magnitude']}", 1 if up else -1)
+                if not (r or {}).get("priced_in"):
+                    self.breaking_check(i, f"{c['label']}: {it['headline'][:300]}", f"{it['exchange']} filing", it["url"])
+        self.consider(sym)
 
     # ================================================================== results
     def poll_results(self) -> None:
@@ -314,14 +410,11 @@ class Radar:
                 continue
             if a["score"]:
                 self.store.track(sym, "results", a["verdict"], 1 if a["score"] > 0 else -1)
-            if sym in self.portfolio():
-                self.notify(sym, self.format_result(sym, kind, a), urgent=True)
-            else:
-                tone = "+" if a["score"] > 0 else "-" if a["score"] < 0 else "?"
-                self.store.log_event(sym, "results", f"Q results {a['verdict']} ({a['score']:+d}): "
-                                     + "; ".join(a["reasons"]), tone,
-                                     HIGH if abs(a["score"]) >= 3 else MEDIUM, "NSE")
-                self.consider(sym)
+            self.notify(sym, self.format_result(sym, kind, a), urgent=True)
+            tone = "+" if a["score"] > 0 else "-" if a["score"] < 0 else "?"
+            self.store.log_event(sym, "results", f"Q results {a['verdict']} ({a['score']:+d}): "
+                                 + "; ".join(a["reasons"]), tone, HIGH if abs(a["score"]) >= 3 else MEDIUM, "NSE")
+            self.consider(sym)
         self.warmed_up.add("results")
 
     def format_result(self, sym, kind, a) -> str:
@@ -356,14 +449,14 @@ class Radar:
             if stamp and today.lower() not in stamp.lower():
                 continue  # holiday / stale data
             rows += r
+        held = self.portfolio()
         seen = {r.get("symbol") for r in rows}
-        for sym in sorted(self.portfolio() - seen):  # portfolio stocks outside the indices
+        for sym in sorted(held - seen):  # portfolio stocks outside the indices
             try:
                 rows.append(self.nse.quote(sym))
             except Exception as e:
                 log.warning("quote %s: %s", sym, e)
 
-        mine = self.portfolio()
         for r in rows:
             sym = r.get("symbol")
             try:
@@ -379,15 +472,14 @@ class Radar:
             sig = self.momentum.update(sym, price, vol, t.timestamp())
             if sig and self.store.first_time(f"burst:{today}:{t.hour}:{sym}:{'+' if sig['move'] > 0 else '-'}"):
                 vtxt = f", volume {sig['vol_ratio']:.1f}× normal pace" if sig["strong"] else ""
-                if sym in mine:
+                if sym in held:
                     self.notify(sym, f"🚀 <b>⭐ {esc(sym)}</b> {sig['move']:+.1f}% in {sig['minutes']:.0f} min{vtxt} "
                                      f"· day {chg:+.1f}% · ₹{price:,.2f}\n" + "\n".join(self._reasons(sym)),
                                 urgent=sig["strong"])
-                else:
-                    self.store.log_event(sym, "burst", f"Price {sig['move']:+.1f}% in {sig['minutes']:.0f} min{vtxt}",
-                                         "+" if sig["move"] > 0 else "-", MEDIUM, "NSE")
-                    self.consider(sym)
-            if sym in mine:
+                self.store.log_event(sym, "burst", f"Price {sig['move']:+.1f}% in {sig['minutes']:.0f} min{vtxt}",
+                                     "+" if sig["move"] > 0 else "-", MEDIUM, "NSE")
+                self.consider(sym)
+            if sym in held:
                 crossed = [lv for lv in config.MOVE_LEVELS if abs(chg) >= lv]
                 new = [lv for lv in crossed
                        if self.store.first_time(f"move:{today}:{sym}:{'+' if chg > 0 else '-'}{lv}")]
@@ -396,7 +488,8 @@ class Radar:
                                      f"(crossed {max(new):g}%)\n" + "\n".join(self._reasons(sym)), urgent=True)
                 try:
                     if price >= float(r.get("yearHigh")) > 0 and self.store.first_time(f"52wh:{today}:{sym}"):
-                        self.store.queue(sym, f"📈 <b>{esc(sym)}</b> new 52-week high ₹{price:,.2f}", 45)
+                        for u in self.holders(sym):
+                            u.queue(sym, f"📈 <b>{esc(sym)}</b> new 52-week high ₹{price:,.2f}", 45)
                 except (TypeError, ValueError):
                     pass
 
@@ -405,7 +498,7 @@ class Radar:
 
     # ================================================================== pre-open
     def preopen_scan(self) -> None:
-        """~9:06 IST: your stocks' opening gaps, plus at most 5 other big gaps that
+        """~9:06 IST: each person's opening gaps, plus at most 5 other big gaps that
         have news behind them (a gap with no news is usually noise)."""
         try:
             rows = self.nse.pre_open("ALL")
@@ -413,34 +506,36 @@ class Radar:
         except Exception as e:
             self.fail("preopen", e)
             return
-        mine_set, mine, others = self.portfolio(), [], []
+        gaps, others = {}, []
         for r in rows:
             try:
                 chg = float(r["pChange"])
             except (TypeError, ValueError, KeyError):
                 continue
             sym = r.get("symbol") or ""
-            if sym in mine_set and abs(chg) >= config.PREOPEN_MIN_GAP:
-                mine.append((chg, sym, r.get("iep")))
-            elif abs(chg) >= config.PREOPEN_MIN_GAP_ALL and self.store.recent_filings(sym, 18):
+            gaps[sym] = (chg, r.get("iep"))
+            if abs(chg) >= config.PREOPEN_MIN_GAP_ALL and self.store.recent_filings(sym, 18):
                 self.store.log_event(sym, "gap", f"Pre-open gap {chg:+.1f}%", "+" if chg > 0 else "-", MEDIUM, "NSE")
                 others.append((chg, sym, r.get("iep")))
-        out = ["🌅 <b>Pre-open</b> (indicative, market opens 9:15)"]
 
         def fmt(chg, sym, iep, star):
             return [f"{'🟢' if chg > 0 else '🔴'} {star}<b>{esc(sym)}</b> {chg:+.1f}%"
                     + (f" · open ~₹{float(iep):,.2f}" if iep not in (None, "", "-") else "")] + self._reasons(sym, 18)
 
-        out.append("<b>Your portfolio</b>")
-        for g in sorted(mine, key=lambda x: -abs(x[0])):
-            out += fmt(*g, "⭐ ")
-        if not mine:
-            out.append("• no big gaps")
-        if others:
-            out.append("<b>Other big gaps with news behind them</b>")
-            for g in sorted(others, key=lambda x: -abs(x[0]))[:5]:
-                out += fmt(*g, "")
-        self.tg.send("\n".join(out))
+        for u in self.users():
+            mine = [(gaps[s][0], s, gaps[s][1]) for s in u.portfolio()
+                    if s in gaps and abs(gaps[s][0]) >= u.cfg("gap")]
+            out = ["🌅 <b>Pre-open</b> (indicative, market opens 9:15)", "<b>Your portfolio</b>"]
+            for g in sorted(mine, key=lambda x: -abs(x[0])):
+                out += fmt(*g, "⭐ ")
+            if not mine:
+                out.append("• no big gaps")
+            theirs = [g for g in others if g[1] not in u.portfolio() and g[1] not in u.muted()]
+            if theirs:
+                out.append("<b>Other big gaps with news behind them</b>")
+                for g in sorted(theirs, key=lambda x: -abs(x[0]))[:5]:
+                    out += fmt(*g, "")
+            u.send("\n".join(out))
 
     # ================================================================== insiders / deals
     def poll_insiders(self) -> None:
@@ -452,7 +547,6 @@ class Radar:
             self.fail("insider", e)
             return
         first_pass = "insider" not in self.warmed_up
-        mine = self.portfolio()
         for r in rows:
             sym = (r.get("symbol") or "").upper()
             who = r.get("acqName") or r.get("personName") or ""
@@ -472,10 +566,9 @@ class Radar:
                 continue
             what = f"Promoter {'bought' if buy else 'sold'} ₹{value_cr:,.1f} cr ({who})"
             self.store.add_filing(sym, what, HIGH, "")
-            if sym in mine:
-                self.notify(sym, f"{'🟢' if buy else '🔴'} <b>⭐ {esc(sym)}</b> · {esc(what)} via "
-                                 f"{esc(r.get('acqMode') or 'market')}", urgent=True)
-            elif buy:
+            self.notify(sym, f"{'🟢' if buy else '🔴'} <b>⭐ {esc(sym)}</b> · {esc(what)} via "
+                             f"{esc(r.get('acqMode') or 'market')}", urgent=True)
+            if buy:
                 self.store.log_event(sym, "insider", what, "+", HIGH, "NSE")
                 self.store.track(sym, "insider", "promoter buy", 1)
                 self.consider(sym)
@@ -489,7 +582,6 @@ class Radar:
             self.fail("deals", e)
             return
         first_pass = "deals" not in self.warmed_up
-        mine = self.portfolio()
         for r in rows:
             sym = (r.get("symbol") or "").upper()
             try:
@@ -504,9 +596,8 @@ class Radar:
                 continue
             what = f"{r['kind']} deal: {r.get('clientName')} {side} ₹{value_cr:,.0f} cr @ ₹{px:,.2f}"
             self.store.add_filing(sym, what, MEDIUM, "")
-            if sym in mine:
-                self.notify(sym, f"🐋 <b>⭐ {esc(sym)}</b> · {esc(what)}")
-            elif side == "BUY":
+            self.notify(sym, f"🐋 <b>⭐ {esc(sym)}</b> · {esc(what)}")
+            if side == "BUY":
                 self.store.log_event(sym, "deal", what, "+", MEDIUM, "NSE")
                 self.store.track(sym, "deal", "bulk/block buy", 1)
                 self.consider(sym)
@@ -552,21 +643,21 @@ class Radar:
         a["_title"] = title
         c = classify(title)
         t = a["tone"] if a["tone"] != "?" else c["tone"]
-        mine_set = self.portfolio()
+        held = self.portfolio()
         syms = a["stocks"] + a["others"]
-        mine = [s for s in syms if s in mine_set]
+        mine = [s for s in syms if s in held]
 
         # --- AI reasoning: who is affected, which way, and why (incl. second-order effects)
         ai_imp = []
         if self.wants_ai(a, c, syms, mine):
-            ai = self.ai.read(title, src, sorted(mine_set))
+            ai = self.ai.read(title, src, sorted(held))
             if ai:
                 if ai["priced_in"]:
                     a["already_moved"] = True
                 if ai["relevant"]:
                     # guard against made-up symbols: keep only real NSE symbols
                     ai_imp = [i for i in ai["impacts"] if i["confidence"] >= 0.5
-                              and (i["symbol"] in self.names or i["symbol"] in mine_set)]
+                              and (i["symbol"] in self.names or i["symbol"] in held)]
         ai_by = {i["symbol"]: i for i in ai_imp}
 
         if a["already_moved"]:
@@ -595,8 +686,8 @@ class Radar:
         if a["global"]:
             self.store.log_event("", "global", title, t, "MEDIUM", src, link)
 
-        # --- your portfolio: direct mentions + stocks the AI says are affected
-        for s in mine + [s for s in ai_by if s in mine_set and s not in mine]:
+        # --- portfolios: direct mentions + stocks the AI says are affected
+        for s in mine + [s for s in ai_by if s in held and s not in mine]:
             i = ai_by.get(s)
             tone_s = ("+" if i["direction"] == "up" else "-") if i else t
             ai_line = (f"\n🤖 {'↑' if i['direction'] == 'up' else '↓'} {i['magnitude']} impact likely "
@@ -606,108 +697,122 @@ class Radar:
             self.notify(s, f"📰 {TONE[tone_s]} <b>⭐ {esc(s)}</b> · {esc(label)}\n{esc(title)}{ai_line}\n{stamp}",
                         urgent=urgent)
         for s in set(syms) | set(ai_by):
-            if s not in mine_set:
-                self.consider(s)
+            self.consider(s)
         if not a["already_moved"]:
             for i in ai_imp:
-                if i["symbol"] not in mine_set:
-                    self.breaking_check(i, title, src, link)
+                self.breaking_check(i, title, src, link)
         for s in syms:
-            if s not in mine_set:
-                self.story_check(s, title, src, ai_by.get(s), a["already_moved"])
+            self.story_check(s, title, src, ai_by.get(s), a["already_moved"])
 
-        # --- sector / policy news
+        # --- sector / policy news: ping only people it affects; others get it in the digest
         if a["themes"] and config.NEWS_THEMES and not a["already_moved"]:
             name, exposed = a["themes"][0]
-            hit = [s for s in set(exposed) | set(ai_by) if s in mine_set]
             if ai_by:
                 who = ", ".join(f"{s} {'↑' if i['direction'] == 'up' else '↓'}" for s, i in ai_by.items())
                 body = f"🤖 Likely impact: {esc(who)}\n" + "".join(
                     f"   • {esc(s)}: {esc(i['why'])}\n" for s, i in list(ai_by.items())[:3])
             else:
                 body = f"Most exposed: {esc(', '.join(exposed[:6]))}\n"
-            msg = (f"🧭 <b>Sector news · {esc(name)}</b>\n{esc(title)}\n" + body
-                   + (f"Affects your: <b>{esc(', '.join(hit))}</b>\n" if hit else "") + stamp)
-            if hit and not quiet_hours(now()) and self.store.first_time(f"theme:{name}:{int(time.time() // 3600)}"):
-                self.tg.send(msg)
-            else:
-                self.store.queue("", msg, 30)
+            slot = int(time.time() // 3600)
+            for u in self.users():
+                hit = [s for s in set(exposed) | set(ai_by) if s in u.portfolio()]
+                msg = (f"🧭 <b>Sector news · {esc(name)}</b>\n{esc(title)}\n" + body
+                       + (f"Affects your: <b>{esc(', '.join(sorted(hit)))}</b>\n" if hit else "") + stamp)
+                if hit and not u.quiet() and self.store.first_time(f"theme:{u.chat}:{name}:{slot}"):
+                    u.send(msg)
+                else:
+                    u.queue("", msg, 30)
         elif a["global"] and a["dramatic"] and self.store.first_time(f"global:{int(time.time() // 3600)}"):
-            self.tg.send(f"🌍 <b>Global cue</b>\n{esc(title)}\n{stamp}")
+            self.broadcast(f"🌍 <b>Global cue</b>\n{esc(title)}\n{stamp}")
 
     def breaking_check(self, i: dict, title: str, src: str, link: str) -> None:
         """⚡ One headline or filing that the AI judges a LARGE move with high confidence.
-        Sent immediately, any time of day: this is the 'don't wait for confirmation' alert."""
+        Sent immediately, any time of day, to everyone who doesn't already hold the stock
+        (holders get it as a portfolio alert)."""
         sym = i["symbol"]
-        if (i["magnitude"] != "large" or i["confidence"] < config.BREAKING_MIN_CONF
-                or sym in self.store.muted() or sym in self.portfolio()):
-            return
-        day = now().strftime("%Y-%m-%d")
-        if (self.store.has_seen(f"brk:{day}:{sym}") or self.store.has_seen(f"opp:{day}:{sym}")
-                or self.store.has_seen(f"story:{day}:{sym}:sent")):
+        if i["magnitude"] != "large":
             return
         up = i["direction"] == "up"
         dc = self.day_change.get(sym)
         if dc is not None and (dc >= 3 if up else dc <= -3):
             return  # the market already reacted; not early any more
-        if self.store.count_today("brk", day) >= config.BREAKING_MAX_PER_DAY:
-            self.store.queue(sym, f"⚡ <b>{esc(sym)}</b> {'↑' if up else '↓'} {esc(i['why'])}", 80)
-            return
-        self.store.first_time(f"brk:{day}:{sym}")
-        n = self.store.count_today("brk", day)
-        lines = [f"⚡ <b>BREAKING · {esc(sym)}</b> {'🟢 ↑' if up else '🔴 ↓'} large move likely "
-                 f"({i['confidence']:.0%} confidence)",
-                 f"🤖 {esc(i['why'])}",
-                 f"📰 {esc(title[:300])}",
-                 f"<i>{esc(src)} · {now().strftime('%H:%M:%S')}</i>"
-                 + (f" · price today {dc:+.1f}%" if dc is not None else "")]
-        if link:
-            lines.append(f'<a href="{esc(link)}">Source</a>')
-        lines.append(f"<i>Single source, not yet confirmed by other outlets. Breaking {n} of "
-                     f"{config.BREAKING_MAX_PER_DAY} today.</i>")
-        self.tg.send("\n".join(lines), buttons=self.stock_buttons(sym))
+        day = now().strftime("%Y-%m-%d")
+        for u in self.outsiders(sym):
+            if i["confidence"] < u.cfg("breakconf"):
+                continue
+            if (self.store.has_seen(u.key("brk", day, sym)) or self.store.has_seen(u.key("opp", day, sym))
+                    or self.store.has_seen(u.key("story", day, sym))):
+                continue
+            cap = u.cfg("maxbreak")
+            if u.count("brk", day) >= cap:
+                u.queue(sym, f"⚡ <b>{esc(sym)}</b> {'↑' if up else '↓'} {esc(i['why'])}", 80)
+                continue
+            self.store.first_time(u.key("brk", day, sym))
+            n = u.count("brk", day)
+            lines = [f"⚡ <b>BREAKING · {esc(sym)}</b> {'🟢 ↑' if up else '🔴 ↓'} large move likely "
+                     f"({i['confidence']:.0%} confidence)",
+                     f"🤖 {esc(i['why'])}",
+                     f"📰 {esc(title[:300])}",
+                     f"<i>{esc(src)} · {now().strftime('%H:%M:%S')}</i>"
+                     + (f" · price today {dc:+.1f}%" if dc is not None else "")]
+            if link:
+                lines.append(f'<a href="{esc(link)}">Source</a>')
+            lines.append(f"<i>Single source, not yet confirmed by other outlets. Breaking {n} of {cap} today.</i>")
+            u.send("\n".join(lines), buttons=self.stock_buttons(sym))
 
     def story_check(self, sym: str, title: str, src: str, ai_i, moved: bool) -> None:
-        """📣 A stock outside your portfolio is being covered by several outlets at once.
-        Send the headlines plus the AI's reading of what it means for the price."""
-        day = now().strftime("%Y-%m-%d")
-        key = f"story:{day}:{sym}"
-        if sym in self.store.muted() or self.store.get(key) or quiet_hours(now()) \
-                or self.store.has_seen(f"opp:{day}:{sym}") or self.store.has_seen(f"brk:{day}:{sym}"):
+        """📣 A stock is being covered by several outlets at once. Sent (with the AI's
+        reading) to everyone who doesn't hold it, once per stock per day each."""
+        people = [u for u in self.outsiders(sym) if not u.quiet()]
+        if not people:
             return
         outlets = self.store.news_by_source(sym, config.STORY_WINDOW_H)
-        if len(outlets) < config.STORY_MIN_OUTLETS:
+        day = now().strftime("%Y-%m-%d")
+        people = [u for u in people if len(outlets) >= u.cfg("outlets")
+                  and not self.store.has_seen(u.key("story", day, sym))
+                  and not self.store.has_seen(u.key("opp", day, sym))
+                  and not self.store.has_seen(u.key("brk", day, sym))
+                  and not self.store.get(f"storyq:{day}:{u.chat}:{sym}")]
+        if not people:
             return
-        if self.store.count_today("story", day) >= config.STORY_MAX_PER_DAY:
-            self.store.set(key, "capped")
-            self.store.queue(sym, f"📣 <b>{esc(sym)}</b> covered by {len(outlets)} outlets: {esc(title[:120])}", 60)
-            return
-        if ai_i is None and self.ai.provider:  # the headline that tipped it over may not have had an AI read
-            r = self.ai.read(title, src, sorted(self.portfolio()))
-            if r and r["priced_in"]:
-                moved = True
-            ai_i = next((i for i in (r or {}).get("impacts", []) if i["symbol"] == sym), None)
+        # One AI reading per stock per day, shared by everyone
+        ck = (day, sym)
+        if ck in self._story_ai:
+            ai_i, ai_moved = self._story_ai[ck]
+            moved = moved or ai_moved
+        else:
+            ai_moved = False
+            if ai_i is None and self.ai.provider:  # the headline that tipped it over may not have had an AI read
+                r = self.ai.read(title, src, sorted(self.portfolio()))
+                ai_moved = bool(r and r["priced_in"])
+                ai_i = next((i for i in (r or {}).get("impacts", []) if i["symbol"] == sym), None)
+            self._story_ai[ck] = (ai_i, ai_moved)
+            moved = moved or ai_moved
+        if self.ai.provider and ai_i is None:
+            return  # AI sees no price effect for this stock: stay quiet
         dc = self.day_change.get(sym)
         if ai_i and dc is not None and abs(dc) >= 7 and (dc > 0) == (ai_i["direction"] == "up"):
             moved = True
-        if self.ai.provider and ai_i is None:
-            self.store.set(key, "no-impact")  # AI sees no price effect for this stock: stay quiet
-            return
-        self.store.set(key, "sent")
-        self.store.first_time(f"story:{day}:{sym}:sent")
-        n = self.store.count_today("story", day)
-        lines = [f"📣 <b>Story spreading · {esc(sym)}</b> · {len(outlets)} outlets in {config.STORY_WINDOW_H:g}h"]
-        if ai_i:
-            up = ai_i["direction"] == "up"
-            lines.append(f"🤖 {'🟢 ↑' if up else '🔴 ↓'} {ai_i['magnitude']} impact likely "
-                         f"({ai_i['confidence']:.0%}, {esc(ai_i['order'])}): {esc(ai_i['why'])}")
-        if moved:
-            lines.append("⏱️ The price has already moved a lot on this; you may be late.")
-        elif dc is not None:
-            lines.append(f"Price today so far: {dc:+.1f}%")
-        lines += [f"• {esc(h[:140])} <i>({esc(o)})</i>" for o, h in outlets[:4]]
-        lines.append(f"<i>Story alert {n} of {config.STORY_MAX_PER_DAY} today.</i>")
-        self.tg.send("\n".join(lines), buttons=self.stock_buttons(sym))
+        for u in people:
+            cap = u.cfg("maxstory")
+            if u.count("story", day) >= cap:
+                self.store.set(f"storyq:{day}:{u.chat}:{sym}", "1")
+                u.queue(sym, f"📣 <b>{esc(sym)}</b> covered by {len(outlets)} outlets: {esc(title[:120])}", 60)
+                continue
+            self.store.first_time(u.key("story", day, sym))
+            n = u.count("story", day)
+            lines = [f"📣 <b>Story spreading · {esc(sym)}</b> · {len(outlets)} outlets in {config.STORY_WINDOW_H:g}h"]
+            if ai_i:
+                up = ai_i["direction"] == "up"
+                lines.append(f"🤖 {'🟢 ↑' if up else '🔴 ↓'} {ai_i['magnitude']} impact likely "
+                             f"({ai_i['confidence']:.0%}, {esc(ai_i['order'])}): {esc(ai_i['why'])}")
+            if moved:
+                lines.append("⏱️ The price has already moved a lot on this; you may be late.")
+            elif dc is not None:
+                lines.append(f"Price today so far: {dc:+.1f}%")
+            lines += [f"• {esc(h[:140])} <i>({esc(o)})</i>" for o, h in outlets[:4]]
+            lines.append(f"<i>Story alert {n} of {cap} today.</i>")
+            u.send("\n".join(lines), buttons=self.stock_buttons(sym))
 
     # ================================================================== learning
     def poll_outcomes(self) -> None:
@@ -765,20 +870,24 @@ class Radar:
             d -= timedelta(days=1)
         return d.replace(hour=15, minute=30, second=0, microsecond=0)
 
-    def top_candidates(self, since_ts: float, limit: int = 8) -> list:
-        """Stocks outside the portfolio ranked by opportunity score."""
-        mine = self.portfolio()
-        syms = {e["symbol"] for e in self.store.events_since(since_ts) if e["symbol"] and e["symbol"] not in mine}
+    def top_candidates(self, since_ts: float, limit: int = 8, user: User = None) -> list:
+        """Stocks outside a person's portfolio ranked by evidence score."""
+        user = user or self.owner
+        mine, muted = user.portfolio(), user.muted()
+        syms = {e["symbol"] for e in self.store.events_since(since_ts)
+                if e["symbol"] and e["symbol"] not in mine and e["symbol"] not in muted}
+        floor = user.cfg("digestscore")
         scored = []
         for s in syms:
             sc = score_events(self.store.events_for(s, 24), self.day_change.get(s))
-            if sc["score"] >= config.OPP_DIGEST_SCORE:
+            if sc["score"] >= floor:
                 scored.append((sc["score"], s, sc))
         return sorted(scored, key=lambda x: (-x[0], x[1]))[:limit]
 
-    def brief(self, since: datetime, title: str) -> list:
+    def brief(self, since: datetime, title: str, user: User = None) -> list:
+        user = user or self.owner
         ev = self.store.events_since(since.timestamp())
-        mine = self.portfolio()
+        mine = user.portfolio()
         out = [f"🗞️ <b>{title}</b> · since {since.strftime('%a %H:%M')}"]
 
         glob = [e for e in ev if e["kind"] == "global"][-5:]
@@ -787,7 +896,7 @@ class Radar:
 
         out.append("\n<b>Your portfolio</b>")
         if not mine:
-            out.append("• empty. Send /add SYMBOL for each stock you own.")
+            out.append("• empty. Tap ⭐ Portfolio → ➕ Add stocks.")
         per = {}
         for e in ev:
             if e["symbol"] in mine:
@@ -802,7 +911,7 @@ class Radar:
             out.append("• nothing new on your stocks")
 
         out.append("\n<b>Top candidates outside your portfolio</b>")
-        cands = self.top_candidates(since.timestamp())
+        cands = self.top_candidates(since.timestamp(), user=user)
         for sc, s, d in cands:
             last = self.store.events_for(s, 24)[-1]
             out.append(f"{'🟢' if d['direction'] > 0 else '🔴' if d['direction'] < 0 else '🟡'} <b>{esc(s)}</b> "
@@ -819,135 +928,108 @@ class Radar:
                 for k, v in sorted(themes.items(), key=lambda kv: -len(kv[1]))[:5]] or ["• quiet"]
         return out
 
-    def send_digest(self, title: str = "Digest") -> None:
-        rows = self.store.take_queue()
-        if not rows:
-            return
-        mine = self.portfolio()
-        port = [r for r in rows if r[1] in mine]
-        cands = [r for r in rows if r[1] and r[1] not in mine]
-        rest = [r for r in rows if not r[1]]
-        out = [f"📋 <b>{title}</b> · {len(rows)} items held back to avoid pinging you"]
-        if port:
-            out += ["\n<b>Your portfolio</b>"] + [r[2] for r in port[:15]]
-        if cands:
-            out += ["\n<b>Candidates (not strong enough to ping)</b>"] + [r[2] for r in cands[:8]]
-        if rest:
-            out += ["\n<b>Sector news</b>"] + [r[2].split("\n<i>")[0] for r in rest[:5]]
-        self.tg.send_long(out)
+    def send_digest(self, title: str = "Digest", user: User = None) -> None:
+        for u in ([user] if user else self.users()):
+            rows = self.store.take_queue(u.chat)
+            if not rows:
+                continue
+            mine = u.portfolio()
+            port = [r for r in rows if r[1] in mine]
+            cands = [r for r in rows if r[1] and r[1] not in mine]
+            rest = [r for r in rows if not r[1]]
+            out = [f"📋 <b>{title}</b> · {len(rows)} items held back to avoid pinging you"]
+            if port:
+                out += ["\n<b>Your portfolio</b>"] + [r[2] for r in port[:15]]
+            if cands:
+                out += ["\n<b>Candidates (not strong enough to ping)</b>"] + [r[2] for r in cands[:8]]
+            if rest:
+                out += ["\n<b>Sector news</b>"] + [r[2].split("\n<i>")[0] for r in rest[:5]]
+            u.send_long(out)
 
     def morning_digest(self) -> None:
         t = now()
-        self.store.take_queue()  # the brief below covers everything held back overnight
-        self.tg.send_long(self.brief(self.last_close(t), "Pre-market brief"))
         try:
             rows = self.nse.board_meetings(t.date(), (t + timedelta(days=14)).date())
         except Exception as e:
             self.fail("digest", e)
-            return
-        mine = self.portfolio()
-        results, corp = [], []
-        for r in rows:
-            sym = (r.get("bm_symbol") or r.get("symbol") or "").upper()
-            purpose = f"{r.get('bm_purpose', '')} {r.get('bm_desc', '')}"
-            d = r.get("bm_date", "")
-            m = re.search(r"bonus|split|sub-?division|buy-?back", purpose, re.I)
-            if sym in mine and re.search(r"result", purpose, re.I):
-                results.append((d, sym))
-            elif m and (sym in mine or sym in self.universe):
-                corp.append((d, sym, m.group(0).lower(), sym in mine))
-            elif sym in mine and re.search(r"fund|qip|preferential", purpose, re.I):
-                corp.append((d, sym, "fund raising", True))
-        results.sort(); corp.sort()
-        text = ["📅 <b>Catalysts ahead</b>", "<b>Your results (next 14 days)</b>"]
-        text += [f"• {esc(d)} — <b>{esc(s)}</b>" for d, s in results[:20]] or ["• none"]
-        text.append("<b>Bonus / split / buyback / fund raising</b>")
-        text += [f"• {esc(d)} — {'⭐ ' if m else ''}<b>{esc(s)}</b> {esc(w)}" for d, s, w, m in corp[:12]] or ["• none"]
-        self.tg.send_long(text)
+            rows = None
+        for u in self.users():
+            self.store.take_queue(u.chat)  # the brief covers everything held back overnight
+            u.send_long(self.brief(self.last_close(t), "Pre-market brief", user=u))
+            if rows is None:
+                continue
+            mine = u.portfolio()
+            results, corp = [], []
+            for r in rows:
+                sym = (r.get("bm_symbol") or r.get("symbol") or "").upper()
+                purpose = f"{r.get('bm_purpose', '')} {r.get('bm_desc', '')}"
+                d = r.get("bm_date", "")
+                m = re.search(r"bonus|split|sub-?division|buy-?back", purpose, re.I)
+                if sym in mine and re.search(r"result", purpose, re.I):
+                    results.append((d, sym))
+                elif m and (sym in mine or sym in self.universe):
+                    corp.append((d, sym, m.group(0).lower(), sym in mine))
+                elif sym in mine and re.search(r"fund|qip|preferential", purpose, re.I):
+                    corp.append((d, sym, "fund raising", True))
+            results.sort(); corp.sort()
+            text = ["📅 <b>Catalysts ahead</b>", "<b>Your results (next 14 days)</b>"]
+            text += [f"• {esc(d)} — <b>{esc(s)}</b>" for d, s in results[:20]] or ["• none"]
+            text.append("<b>Bonus / split / buyback / fund raising</b>")
+            text += [f"• {esc(d)} — {'⭐ ' if m else ''}<b>{esc(s)}</b> {esc(w)}" for d, s, w, m in corp[:12]] or ["• none"]
+            u.send_long(text)
 
     # ================================================================== settings & updates
-    SETTINGS = {  # Telegram name -> (config attribute, type, what it means)
-        "maxopp": ("OPP_MAX_PER_DAY", int, "max opportunity alerts per day"),
-        "score": ("OPP_MIN_SCORE", float, "evidence score (0-100) needed to ping you"),
-        "digestscore": ("OPP_DIGEST_SCORE", float, "score needed to appear in digests"),
-        "cooldown": ("STOCK_COOLDOWN_MIN", float, "minutes between routine pings per portfolio stock (0 = off)"),
-        "burst": ("MOMENTUM_MOVE", float, "% move in 5 min that counts as early momentum"),
-        "gap": ("PREOPEN_MIN_GAP", float, "% pre-open gap for your stocks"),
-        "outlets": ("STORY_MIN_OUTLETS", int, "outlets covering a stock before a 📣 story alert"),
-        "maxstory": ("STORY_MAX_PER_DAY", int, "max 📣 story alerts per day"),
-        "breakconf": ("BREAKING_MIN_CONF", float, "AI confidence (0-1) needed for a ⚡ breaking alert"),
-        "maxbreak": ("BREAKING_MAX_PER_DAY", int, "max ⚡ breaking alerts per day"),
-    }
-
-    def apply_saved_settings(self) -> None:
-        for name, (attr, typ, _) in self.SETTINGS.items():
-            v = self.store.get("cfg:" + name)
-            if v is not None:
-                setattr(config, attr, typ(float(v)))
-        q = self.store.get("cfg:quiet")
-        if q:
-            a, b = (0, 0) if q == "off" else map(int, q.split("-"))
-            config.QUIET_START, config.QUIET_END = a, b
-
-    def settings_text(self) -> str:
-        lines = ["⚙️ <b>Settings</b> (change with /set NAME VALUE)"]
-        for name, (attr, _, desc) in self.SETTINGS.items():
-            lines.append(f"<b>{name}</b> = {getattr(config, attr):g} · {desc}")
-        quiet = "off" if config.QUIET_START == config.QUIET_END else f"{config.QUIET_START}-{config.QUIET_END}"
-        lines.append(f"<b>quiet</b> = {quiet} · quiet hours, e.g. /set quiet 23-7 or /set quiet off")
-        return "\n".join(lines)
-
-    def set_setting(self, name: str, value: str) -> str:
+    def set_setting(self, name: str, value: str, chat: str = None) -> str:
+        chat = str(chat or config.TELEGRAM_CHAT_ID)
         name = name.lower()
         if name == "quiet":
             v = value.lower()
             if v != "off" and not re.fullmatch(r"\d{1,2}-\d{1,2}", v):
-                return "Use /set quiet 23-7 or /set quiet off"
-            self.store.set("cfg:quiet", v)
-            self.apply_saved_settings()
+                return "Use quiet 23-7 or quiet off"
+            self.store.set(f"cfg:{chat}:quiet", v)
             return f"Quiet hours: {v}"
-        if name not in self.SETTINGS:
-            return "Unknown setting. Send /settings to see the list."
-        attr, typ, desc = self.SETTINGS[name]
+        if name not in SETTINGS:
+            return "Unknown setting. Open ⚙️ Settings to see the list."
+        attr, typ, desc = SETTINGS[name]
         try:
             val = typ(float(value))
         except ValueError:
             return f"{name} needs a number."
-        self.store.set("cfg:" + name, val)
-        setattr(config, attr, val)
+        self.store.set(f"cfg:{chat}:{name}", val)
         return f"✅ {name} = {val:g} ({desc})"
 
     def self_update(self) -> None:
         """Pull the latest code from GitHub and restart (the service manager starts it again)."""
         import subprocess, sys
         root = str(config.ROOT)
+        o = self.owner
         if not (config.ROOT / ".git").exists():
-            self.tg.send("Updates aren't connected yet. Run the one-time GitHub setup from the README, then /update works.")
+            o.send("Updates aren't connected yet. Run the one-time GitHub setup from the README.")
             return
         def git(*a):
             return subprocess.run(["git", "-C", root, *a], capture_output=True, text=True, timeout=120)
         before = git("rev-parse", "HEAD").stdout.strip()
         r = git("fetch", "origin", "main")
         if r.returncode != 0:
-            self.tg.send(f"⚠️ Update failed:\n<code>{esc((r.stdout + r.stderr).strip()[-600:])}</code>")
+            o.send(f"⚠️ Update failed:\n<code>{esc((r.stdout + r.stderr).strip()[-600:])}</code>")
             return
         after = git("rev-parse", "origin/main").stdout.strip()
         if after == before:
-            self.tg.send("Already on the latest version.")
+            o.send("Already on the latest version.")
             return
-        git("reset", "--hard", "origin/main")  # your .env, portfolio and history are untracked, so they're kept
-        log = git("log", "--format=• %s", f"{before}..{after}").stdout.strip()[:800]
+        git("reset", "--hard", "origin/main")  # .env, portfolios and history are untracked, so they're kept
+        changes = git("log", "--format=• %s", f"{before}..{after}").stdout.strip()[:800]
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-r", f"{root}/requirements.txt"],
                        capture_output=True, timeout=300)
-        self.tg.send("⬇️ Updated. Restarting in a few seconds…\n" + esc(log))
+        o.send("⬇️ Updated. Restarting in a few seconds…\n" + esc(changes))
         sys.exit(0)  # systemd (or run.sh on Termux) restarts the engine with the new code
 
     # ================================================================== buttons & menu
     MENU = [("menu", "Show the button panel"), ("portfolio", "Your stocks: view, add, remove"),
             ("top", "Strongest candidates right now"), ("brief", "News summary (pick hours)"),
             ("digest", "Get held-back items now"), ("ask", "Ask the AI about any headline"),
-            ("settings", "Change limits with ➕ / ➖ buttons"), ("learn", "How past signals played out"),
-            ("ai", "AI status"), ("status", "Health check"), ("update", "Install the latest version")]
+            ("settings", "Change your limits with ➕ / ➖ buttons"), ("learn", "How past signals played out"),
+            ("status", "Health check")]
     PANEL = [["🎯 Top", "🗞️ Brief", "⭐ Portfolio"], ["🤖 Ask AI", "⚙️ Settings", "📥 Digest"],
              ["📊 Learn", "🩺 Status", "☰ More"]]
     PANEL_MAP = {"🎯 Top": "/top", "🗞️ Brief": "/brief", "⭐ Portfolio": "/portfolio", "🤖 Ask AI": "/ask",
@@ -956,24 +1038,25 @@ class Radar:
     STEPS = {  # setting -> (button label, step, min, max)
         "maxopp": ("🎯 Opportunities/day", 1, 0, 50), "score": ("🎯 Min evidence score", 5, 30, 95),
         "digestscore": ("📋 Digest min score", 5, 0, 90), "cooldown": ("⏱ Cooldown min", 15, 0, 240),
-        "burst": ("🚀 Burst % in 5 min", 0.5, 0.5, 5), "gap": ("🌅 Pre-open gap %", 0.5, 0.5, 10),
+        "gap": ("🌅 Pre-open gap %", 0.5, 0.5, 10),
         "outlets": ("📣 Outlets for story", 1, 1, 6), "maxstory": ("📣 Stories/day", 1, 0, 50),
         "breakconf": ("⚡ Breaking confidence", 0.05, 0.5, 0.95), "maxbreak": ("⚡ Breaking/day", 1, 0, 50)}
+    OWNER_ONLY = {"/update", "/setkey", "/users"}
 
     def stock_buttons(self, sym: str):
         return [[(f"➕ Add {sym} to portfolio", f"add:{sym}"), (f"🔇 Mute {sym}", f"mute:{sym}")]]
 
-    def settings_view(self):
+    def settings_view(self, u: User):
         rows = []
         for name, (label, *_r) in self.STEPS.items():
-            val = getattr(config, self.SETTINGS[name][0])
-            rows.append([("➖", f"set:{name}:-"), (f"{label}: {val:g}", "noop"), ("➕", f"set:{name}:+")])
-        quiet = "off" if config.QUIET_START == config.QUIET_END else f"{config.QUIET_START}:00–{config.QUIET_END}:00"
+            rows.append([("➖", f"set:{name}:-"), (f"{label}: {u.cfg(name):g}", "noop"), ("➕", f"set:{name}:+")])
+        s, e = u.quiet_range()
+        quiet = "off" if s == e else f"{s}:00–{e}:00"
         rows.append([(f"🌙 Quiet hours: {quiet} (tap to switch)", "quiet:toggle")])
-        return "⚙️ <b>Settings</b>\nTap ➕ / ➖ to change. Changes apply immediately and survive restarts.", rows
+        return "⚙️ <b>Your settings</b>\nTap ➕ / ➖ to change. Applies immediately, only to you.", rows
 
-    def portfolio_view(self):
-        mine, muted = sorted(self.portfolio()), sorted(self.store.muted())
+    def portfolio_view(self, u: User):
+        mine, muted = sorted(u.portfolio()), sorted(u.muted())
         text = (f"⭐ <b>Your portfolio</b> ({len(mine)}): {esc(', '.join(mine)) or 'empty'}\n"
                 f"🔇 Muted: {esc(', '.join(muted)) or 'none'}\n"
                 f"<i>Also watching {len(self.universe)} index stocks and ~{len(self.market_matcher)} companies in the news.</i>")
@@ -982,18 +1065,35 @@ class Radar:
         rows += [[(f"🔊 Unmute {s}", f"unmute:{s}") for s in muted[i:i + 2]] for i in range(0, len(muted), 2)]
         return text, rows
 
-    def more_view(self):
-        return "☰ <b>More</b>", [[("🤖 AI status", "cmd:/ai"), ("🔑 Set AI key", "prompt:setkey")],
-                                [("⬆️ Update now", "cmd:/update"), ("❓ What does each alert mean?", "cmd:/help")]]
+    def more_view(self, u: User):
+        rows = [[("❓ What does each alert mean?", "cmd:/help")]]
+        if u.is_owner:
+            rows = [[("👥 Users", "cmd:/users"), ("🤖 AI status", "cmd:/ai")],
+                    [("🔑 Set AI key", "prompt:setkey"), ("⬆️ Update now", "cmd:/update")]] + rows
+        return "☰ <b>More</b>", rows
+
+    def users_view(self):
+        people = self.store.users("active")
+        lines = [f"👥 <b>People using the bot</b> ({len(people)})"]
+        rows = []
+        for chat, name in people:
+            u = User(self, chat, name)
+            tag = " (you)" if u.is_owner else ""
+            lines.append(f"• {esc(name)}{tag} · {len(u.portfolio())} stocks")
+            if not u.is_owner:
+                rows.append([(f"🚫 Remove {name[:30]}", f"kick:{chat}")])
+        removed = self.store.users("removed")
+        rows += [[(f"↩️ Allow {n[:30]} again", f"allow:{c}")] for c, n in removed]
+        return "\n".join(lines), rows
 
     HELP = ("<b>What you'll receive</b>\n"
             "⭐ Anything about your portfolio stocks, with 🤖 AI reasoning\n"
             "⚡ Breaking: one report the AI judges a large, confident move\n"
             "🎯 Opportunity: several kinds of evidence agree\n"
-            "📣 Story: 3+ outlets covering a stock\n"
+            "📣 Story: several outlets covering a stock\n"
             "🧭 Sector news that affects your stocks\n"
             "🌅 9:06 pre-open gaps · ☀️ 8:30 brief · 📋 digests 12:30, 3:45, 8:30pm\n\n"
-            "Use the buttons below the typing box, or the ☰ Menu. "
+            "Start by tapping ⭐ Portfolio → ➕ Add stocks. "
             "Paste any headline as a message and the AI tells you what it means for stocks.")
 
     # ================================================================== commands
@@ -1001,186 +1101,212 @@ class Radar:
         for ev in self.tg.commands():
             if isinstance(ev, str):
                 ev = {"type": "text", "text": ev}
+            chat = str(ev.get("chat") or config.TELEGRAM_CHAT_ID)
+            status = self.store.user_status(chat)
+            if status == "removed":
+                continue
+            u = User(self, chat, ev.get("name", ""))
+            if status is None:  # first time this person talks to the bot: give them their own space
+                self.store.user_add(chat, ev.get("name") or "someone")
+                u.send("👋 <b>Welcome to Dalal Radar.</b>\n" + self.HELP, reply_keyboard=self.PANEL)
+                if not u.is_owner:
+                    self.owner.send(f"👤 {esc(ev.get('name') or 'Someone')} started using the bot.",
+                                    buttons=[[("🚫 Remove", f"kick:{chat}")]])
+                    self.tg.set_menu(self.MENU)
+                if ev["type"] == "text" and ev["text"].lower().startswith("/start"):
+                    continue
             try:
                 if ev["type"] == "tap":
-                    self.on_tap(ev)
+                    self.on_tap(u, ev)
                 else:
-                    self.on_text(ev["text"])
+                    self.on_text(u, ev["text"])
             except SystemExit:
                 raise
             except Exception as e:  # a bad command must never stop the engine
                 log.exception("command failed")
-                self.tg.send(f"⚠️ That didn't work: {esc(str(e)[:200])}")
+                u.send(f"⚠️ That didn't work: {esc(str(e)[:200])}")
 
-    def on_tap(self, ev: dict) -> None:
+    def on_tap(self, u: User, ev: dict) -> None:
         data, mid = ev["data"], ev["msg_id"]
         kind, _, rest = data.partition(":")
         toast = ""
         if kind == "cmd":
-            self.on_text(rest)
+            self.on_text(u, rest)
         elif kind == "set":
             name, _, sign = rest.partition(":")
             _l, step, lo, hi = self.STEPS[name]
-            cur = getattr(config, self.SETTINGS[name][0])
-            new = round(min(hi, max(lo, cur + (step if sign == "+" else -step))), 2)
-            self.set_setting(name, str(new))
-            self.tg.edit(mid, *self.settings_view())
+            new = round(min(hi, max(lo, u.cfg(name) + (step if sign == "+" else -step))), 2)
+            self.set_setting(name, str(new), u.chat)
+            self.tg.edit(mid, *self.settings_view(u), chat=u.chat)
             toast = f"{self.STEPS[name][0]}: {new:g}"
         elif kind == "quiet":
-            self.set_setting("quiet", "23-7" if config.QUIET_START == config.QUIET_END else "off")
-            self.tg.edit(mid, *self.settings_view())
+            s, e = u.quiet_range()
+            self.set_setting("quiet", "23-7" if s == e else "off", u.chat)
+            self.tg.edit(mid, *self.settings_view(u), chat=u.chat)
         elif kind in ("rm", "unmute"):
             if kind == "rm":
-                self.store.watch_remove(rest)
+                self.store.watch_remove(rest, u.chat)
                 self.rebuild_matcher()
             else:
-                self.store.mute(rest, False)
-            self.tg.edit(mid, *self.portfolio_view())
+                self.store.mute(rest, False, u.chat)
+            self.tg.edit(mid, *self.portfolio_view(u), chat=u.chat)
             toast = f"{'Removed' if kind == 'rm' else 'Unmuted'} {rest}"
         elif kind == "add":
-            self.store.watch_add(rest)
+            self.store.watch_add(rest, u.chat)
             self.rebuild_matcher()
             toast = f"⭐ {rest} added to your portfolio"
         elif kind == "mute":
-            self.store.mute(rest)
+            self.store.mute(rest, True, u.chat)
             toast = f"🔇 {rest} muted"
         elif kind == "brief":
-            self.tg.send_long(self.brief(now() - timedelta(hours=float(rest)), f"News brief · last {rest}h"))
+            u.send_long(self.brief(now() - timedelta(hours=float(rest)), f"News brief · last {rest}h", user=u))
         elif kind == "prompt":
-            self.awaiting = rest
-            self.tg.send({"add": "Type the NSE symbols you own, separated by spaces (e.g. <code>TCS HAL IRFC</code>).",
-                          "ask": "Paste any news headline and I'll tell you which stocks it likely moves.",
-                          "setkey": "Paste your Gemini (AQ.… / AIza…) or Groq (gsk_…) key."}.get(rest, "Type it now."))
+            if rest == "setkey" and not u.is_owner:
+                return self.tg.answer(ev["id"], "Only the owner can do that.")
+            self.awaiting[u.chat] = rest
+            u.send({"add": "Type the NSE symbols you own, separated by spaces (e.g. <code>TCS HAL IRFC</code>).",
+                    "ask": "Paste any news headline and I'll tell you which stocks it likely moves.",
+                    "setkey": "Paste your Gemini (AQ.… / AIza…) or Groq (gsk_…) key."}.get(rest, "Type it now."))
+        elif kind in ("kick", "allow") and u.is_owner:
+            self.store.user_set_status(rest, "removed" if kind == "kick" else "active")
+            if mid:
+                self.tg.edit(mid, *self.users_view(), chat=u.chat)
+            toast = "Removed" if kind == "kick" else "Allowed again"
         self.tg.answer(ev["id"], toast)
 
-    def on_text(self, text: str) -> None:
+    def on_text(self, u: User, text: str) -> None:
         text = self.PANEL_MAP.get(text, text)
         if not text.startswith("/"):
-            waiting, self.awaiting = self.awaiting, None
+            waiting = self.awaiting.pop(u.chat, None)
             if waiting == "add":
-                return self.on_text("/add " + text)
+                return self.on_text(u, "/add " + text)
             if waiting == "setkey":
-                return self.on_text("/setkey " + text)
+                return self.on_text(u, "/setkey " + text)
             if waiting == "ask" or len(text) >= 15:  # any pasted headline = ask the AI
-                return self.cmd_ask(text)
-            return self.tg.send("Use the buttons below the typing box, or paste a news headline.",
-                                reply_keyboard=self.PANEL)
+                return self.cmd_ask(u, text)
+            return u.send("Use the buttons below the typing box, or paste a news headline.", reply_keyboard=self.PANEL)
         parts = text.split()
         cmd = parts[0].lower().split("@")[0]
         args = [p.upper().strip(",") for p in parts[1:]]
+        if cmd in self.OWNER_ONLY and not u.is_owner:
+            return u.send("Only the bot's owner can do that.")
         if cmd in ("/start", "/menu", "/help"):
-            self.tg.send(self.HELP, reply_keyboard=self.PANEL)
+            u.send(self.HELP, reply_keyboard=self.PANEL)
         elif cmd == "/more":
-            self.tg.send(*self.more_view())
+            u.send(*self.more_view(u))
+        elif cmd == "/users":
+            u.send(*self.users_view())
         elif cmd in ("/add", "/watch"):
             if not args:
-                return self._prompt("add")
+                return self._prompt(u, "add")
             for a in args:
-                self.store.watch_add(a)
+                self.store.watch_add(a, u.chat)
             self.rebuild_matcher()
-            self.tg.send(*self.portfolio_view())
+            u.send(*self.portfolio_view(u))
         elif cmd in ("/remove", "/unwatch") and args:
             for a in args:
-                self.store.watch_remove(a)
+                self.store.watch_remove(a, u.chat)
             self.rebuild_matcher()
-            self.tg.send(*self.portfolio_view())
+            u.send(*self.portfolio_view(u))
         elif cmd == "/mute" and args:
             for a in args:
-                self.store.mute(a)
-            self.tg.send(f"🔇 Muted: <b>{esc(', '.join(args))}</b>")
+                self.store.mute(a, True, u.chat)
+            u.send(f"🔇 Muted: <b>{esc(', '.join(args))}</b>")
         elif cmd == "/unmute" and args:
             for a in args:
-                self.store.mute(a, False)
-            self.tg.send(f"🔊 Unmuted: <b>{esc(', '.join(args))}</b>")
+                self.store.mute(a, False, u.chat)
+            u.send(f"🔊 Unmuted: <b>{esc(', '.join(args))}</b>")
         elif cmd in ("/portfolio", "/list"):
-            self.tg.send(*self.portfolio_view())
+            u.send(*self.portfolio_view(u))
         elif cmd == "/top":
-            c = self.top_candidates(time.time() - 24 * 3600, 8)
+            c = self.top_candidates(time.time() - 24 * 3600, 8, user=u)
             if not c:
-                return self.tg.send("🎯 No candidate is strong enough right now.")
-            self.tg.send("🎯 <b>Top candidates now</b> (tap to add or mute)\n" + "\n".join(
+                return u.send("🎯 No candidate is strong enough right now.")
+            u.send("🎯 <b>Top candidates now</b> (tap to add or mute)\n" + "\n".join(
                 f"<b>{esc(s)}</b> {sc:.0f}/100 {ARROW[d['direction']]}" for sc, s, d in c),
                 buttons=[[(f"➕ {s}", f"add:{s}"), (f"🔇 {s}", f"mute:{s}")] for _sc, s, _d in c[:6]])
         elif cmd == "/brief":
             if args and args[0].replace(".", "").isdigit():
-                return self.tg.send_long(self.brief(now() - timedelta(hours=float(args[0])), "News brief"))
-            self.tg.send("🗞️ News summary for…", buttons=[[("Last 2h", "brief:2"), ("4h", "brief:4"),
-                                                        ("12h", "brief:12"), ("24h", "brief:24")]])
+                return u.send_long(self.brief(now() - timedelta(hours=float(args[0])), "News brief", user=u))
+            u.send("🗞️ News summary for…", buttons=[[("Last 2h", "brief:2"), ("4h", "brief:4"),
+                                                   ("12h", "brief:12"), ("24h", "brief:24")]])
         elif cmd == "/digest":
-            if self.store.db.execute("SELECT 1 FROM pending LIMIT 1").fetchone():
-                self.send_digest("Digest")
+            if self.store.has_queue(u.chat):
+                self.send_digest("Digest", user=u)
             else:
-                self.tg.send("📥 Nothing held back right now.")
+                u.send("📥 Nothing held back right now.")
         elif cmd == "/setkey":
             if len(parts) < 2:
-                return self._prompt("setkey")
-            self.cmd_setkey(parts[1].strip())
+                return self._prompt(u, "setkey")
+            self.cmd_setkey(u, parts[1].strip())
         elif cmd == "/ask":
             if len(parts) < 2:
-                return self._prompt("ask")
-            self.cmd_ask(text.split(None, 1)[1])
+                return self._prompt(u, "ask")
+            self.cmd_ask(u, text.split(None, 1)[1])
         elif cmd == "/ai":
             self.ai.budget_left()
-            self.tg.send(f"🤖 AI reasoning: {self.ai.provider or 'off'}\n"
-                         f"Headlines read today: {self.ai.calls_today}/{self.ai.max_per_day}"
-                         + (f"\nRecent errors: {self.ai.errors}\n<code>{esc(self.ai.last_error)}</code>" if self.ai.errors else ""),
-                         buttons=None if self.ai.provider else [[("🔑 Set AI key", "prompt:setkey")]])
+            u.send(f"🤖 AI reasoning: {self.ai.provider or 'off'}\n"
+                   f"Headlines read today (everyone): {self.ai.calls_today}/{self.ai.max_per_day}"
+                   + (f"\nRecent errors: {self.ai.errors}\n<code>{esc(self.ai.last_error)}</code>" if self.ai.errors else ""))
         elif cmd == "/learn":
-            self.cmd_learn()
+            self.cmd_learn(u)
         elif cmd == "/settings":
-            self.tg.send(*self.settings_view())
+            u.send(*self.settings_view(u))
         elif cmd == "/set" and len(parts) >= 3:
-            self.tg.send(self.set_setting(parts[1], parts[2]))
+            u.send(self.set_setting(parts[1], parts[2], u.chat))
         elif cmd == "/update":
             self.self_update()
         elif cmd == "/status":
-            bad = {k: v for k, v in self.failures.items() if v}
-            why = "\n".join(f"• {esc(k)}: {esc(self.last_error.get(k, ''))}" for k in bad)
             day = now().strftime("%Y-%m-%d")
-            self.tg.send(f"✅ Running · {now().strftime('%d %b %H:%M:%S')} IST\n"
-                         f"Today: ⚡ {self.store.count_today('brk', day)}/{config.BREAKING_MAX_PER_DAY} · "
-                         f"🎯 {self.store.count_today('opp', day)}/{config.OPP_MAX_PER_DAY} · "
-                         f"📣 {self.store.count_today('story', day)}/{config.STORY_MAX_PER_DAY}\n"
-                         f"Failing sources: {'none' if not bad else ''}" + (f"\n{why}" if why else ""))
+            lines = [f"✅ Running · {now().strftime('%d %b %H:%M:%S')} IST",
+                     f"Your alerts today: ⚡ {u.count('brk', day)}/{u.cfg('maxbreak')} · "
+                     f"🎯 {u.count('opp', day)}/{u.cfg('maxopp')} · 📣 {u.count('story', day)}/{u.cfg('maxstory')}"]
+            if u.is_owner:
+                bad = {k: v for k, v in self.failures.items() if v}
+                lines.append(f"People using the bot: {len(self.store.users('active'))}")
+                lines.append(f"Failing sources: {'none' if not bad else ''}")
+                lines += [f"• {esc(k)}: {esc(self.last_error.get(k, ''))}" for k in bad]
+            u.send("\n".join(lines))
         else:
-            self.tg.send(self.HELP, reply_keyboard=self.PANEL)
+            u.send(self.HELP, reply_keyboard=self.PANEL)
 
-    def _prompt(self, what: str) -> None:
-        self.on_tap({"data": f"prompt:{what}", "msg_id": 0, "id": ""})
+    def _prompt(self, u: User, what: str) -> None:
+        self.on_tap(u, {"data": f"prompt:{what}", "msg_id": 0, "id": ""})
 
-    def cmd_setkey(self, key: str) -> None:
+    def cmd_setkey(self, u: User, key: str) -> None:
         self.store.set("ai_key", key)
         self.ai.key = key
         prov = self.ai.provider
         if not prov:
-            return self.tg.send("That doesn't look like a Gemini (AIza… or AQ.…) or Groq (gsk_…) key.")
+            return u.send("That doesn't look like a Gemini (AIza… or AQ.…) or Groq (gsk_…) key.")
         test = self.ai.read("Government raises import duty on steel to 20%", "test", [])
-        self.tg.send((f"✅ AI reasoning on ({prov}), test read worked." if test is not None else
-                      f"⚠️ Key saved but the test call failed:\n<code>{esc(self.ai.last_error)}</code>")
-                     + "\nPlease delete your message that contains the key.")
+        u.send((f"✅ AI reasoning on ({prov}), test read worked." if test is not None else
+                f"⚠️ Key saved but the test call failed:\n<code>{esc(self.ai.last_error)}</code>")
+               + "\nPlease delete your message that contains the key.")
 
-    def cmd_ask(self, q: str) -> None:
+    def cmd_ask(self, u: User, q: str) -> None:
         if not self.ai.provider:
-            return self.tg.send("AI is off.", buttons=[[("🔑 Set AI key", "prompt:setkey")]])
-        r = self.ai.read(q, "you", sorted(self.portfolio()))
+            return u.send("AI is off. Ask the bot's owner to set an AI key.")
+        r = self.ai.read(q, "you", sorted(u.portfolio()))
         if r is None:
-            return self.tg.send(f"⚠️ AI call failed: <code>{esc(self.ai.last_error)}</code>")
+            return u.send(f"⚠️ AI call failed: <code>{esc(self.ai.last_error)}</code>")
         if not r["impacts"]:
-            return self.tg.send("🤖 No clear effect on any listed stock" + (" (already priced in)." if r["priced_in"] else "."))
+            return u.send("🤖 No clear effect on any listed stock" + (" (already priced in)." if r["priced_in"] else "."))
+        mine = u.portfolio()
         out = ["🤖 <b>Likely impact</b>" + (" · already priced in" if r["priced_in"] else "")]
         for i in r["impacts"]:
-            star = "⭐ " if i["symbol"] in self.portfolio() else ""
+            star = "⭐ " if i["symbol"] in mine else ""
             out.append(f"{'🟢 ↑' if i['direction'] == 'up' else '🔴 ↓'} {star}<b>{esc(i['symbol'])}</b> "
                        f"{i['magnitude']} ({i['confidence']:.0%}, {esc(i['order'])})\n   {esc(i['why'])}")
         out.append("<i>An AI reading of the headline, not a prediction. Check the price before acting.</i>")
-        others = [i["symbol"] for i in r["impacts"] if i["symbol"] not in self.portfolio()][:4]
-        self.tg.send("\n".join(out), buttons=[[(f"➕ {s}", f"add:{s}") for s in others]] if others else None)
+        others = [i["symbol"] for i in r["impacts"] if i["symbol"] not in mine][:4]
+        u.send("\n".join(out), buttons=[[(f"➕ {s}", f"add:{s}") for s in others]] if others else None)
 
-    def cmd_learn(self) -> None:
+    def cmd_learn(self, u: User) -> None:
         rows = self.store.outcome_stats()
         if not rows:
-            return self.tg.send("📊 Nothing measured yet. Each signal's price is checked 1 hour and 1 trading day "
-                                "later; results appear after the first few days.")
+            return u.send("📊 Nothing measured yet. Each signal's price is checked 1 hour and 1 trading day "
+                          "later; results appear after the first few days.")
         out = ["📊 <b>What happened after each kind of signal</b>",
                "(hit = moved the predicted way; avg = average move in that direction)"]
         for r in rows[:15]:
@@ -1188,12 +1314,12 @@ class Radar:
                    if r["n1d"] else "1d: pending")
             h1h = f"1h: avg {r['sum1h'] / r['n1h']:+.1f}% (n={r['n1h']})" if r["n1h"] else ""
             out.append(f"• <b>{esc(r['label'])}</b> [{esc(r['kind'])}] {h1d} {h1h}")
-        self.tg.send_long(out)
+        u.send_long(out)
 
     # ================================================================== health
     def ok(self, job: str) -> None:
         if self.failures.get(job, 0) >= 5:
-            self.tg.send(f"✅ {job} source is working again.")
+            self.owner.send(f"✅ {job} source is working again.")
         self.failures[job] = 0
 
     def fail(self, job: str, err: Exception) -> None:
@@ -1202,8 +1328,8 @@ class Radar:
         self.last_error[job] = f"{type(err).__name__}: {err}"[:160]
         log.warning("%s failed (%d): %s", job, n, err)
         if n == 5 and not job.startswith("news:"):  # one dead news feed isn't worth a ping
-            self.tg.send(f"⚠️ <b>{job}</b> has failed 5 times in a row: {esc(str(err)[:200])}\n"
-                         "Alerts from this source are paused until it recovers.")
+            self.owner.send(f"⚠️ <b>{job}</b> has failed 5 times in a row: {esc(str(err)[:200])}\n"
+                            "Alerts from this source are paused until it recovers.")
 
     # ================================================================== loop
     def once_today(self, name: str, t: datetime) -> bool:
@@ -1215,11 +1341,10 @@ class Radar:
             self.refresh_universe()
         except Exception as e:
             self.fail("universe", e)
-        p = self.portfolio()
         self.tg.set_menu(self.MENU)
-        self.tg.send(f"🛰️ Stock Radar online · portfolio: {len(p)} stocks"
-                     + ("" if p else " (send /add SYMBOL for each stock you own)")
-                     + ". Use the buttons below the typing box.", reply_keyboard=self.PANEL)
+        n = len(self.store.users("active"))
+        self.owner.send(f"🛰️ Stock Radar online · {n} {'person' if n == 1 else 'people'} using it · "
+                        f"your portfolio: {len(self.owner.portfolio())} stocks.", reply_keyboard=self.PANEL)
         nxt = dict.fromkeys(["filings", "results", "prices", "cmds", "news", "insider", "deals", "outcomes"], 0)
         last_universe = last_prune = now().date()
         retry_universe = 0
@@ -1263,7 +1388,6 @@ class Radar:
             for dt in config.DIGEST_TIMES:
                 if dt <= hm < f"{int(dt[:2]) + 1:02d}{dt[2:]}" and self.once_today("dg" + dt, t):
                     self.send_digest(f"Digest {dt}")
-            # Refresh the index list daily, and retry every 10 min if it failed (e.g. NSE hiccup at startup).
             if (t.date() != last_universe and t.hour >= 8) or (not self.universe and mono >= retry_universe):
                 retry_universe = mono + 600
                 try:
@@ -1275,6 +1399,7 @@ class Radar:
                     self.fail("universe", e)
             if t.date() != last_prune:
                 self.store.prune(); last_prune = t.date()
+                self._story_ai.clear()
             time.sleep(1)
 
 

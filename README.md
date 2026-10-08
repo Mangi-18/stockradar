@@ -127,6 +127,19 @@ journalctl -u stockradar -f            # live logs
 ```
 You'll get "🛰️ Stock Radar online" in Telegram.
 
+## Family: everyone gets their own
+
+Anyone who finds the bot in Telegram and presses **Start** can use it right away,
+with **their own** portfolio, mutes, settings, digests and briefs. Nobody sees
+anyone else's stocks. The market is scanned once for everyone, so it costs no
+more to run.
+
+- Portfolio alerts go only to the people who hold that stock
+- ⚡ / 🎯 / 📣 market alerts go to everyone who doesn't hold it, within each person's own limits
+- The owner (`TELEGRAM_CHAT_ID` in `.env`) is told when someone new starts, and has
+  ☰ More → 👥 Users to see who's using it and 🚫 remove anyone
+- Only the owner can ⬆️ update and 🔑 set the AI key; the AI's daily budget is shared
+
 ## Using it: buttons, no typing
 
 - **Button panel** below the typing box: 🎯 Top · 🗞️ Brief · ⭐ Portfolio · 🤖 Ask AI · ⚙️ Settings · 📥 Digest · 📊 Learn · 🩺 Status · ☰ More

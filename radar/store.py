@@ -20,6 +20,10 @@ class Store:
             CREATE INDEX IF NOT EXISTS events_sym ON events(symbol, ts);
             CREATE TABLE IF NOT EXISTS pending (ts REAL, symbol TEXT, text TEXT, score REAL);
             CREATE TABLE IF NOT EXISTS muted (symbol TEXT PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS users (chat TEXT PRIMARY KEY, name TEXT, joined REAL, status TEXT);
+            CREATE TABLE IF NOT EXISTS uwatch (chat TEXT, symbol TEXT, PRIMARY KEY (chat, symbol));
+            CREATE TABLE IF NOT EXISTS umuted (chat TEXT, symbol TEXT, PRIMARY KEY (chat, symbol));
+            CREATE TABLE IF NOT EXISTS upending (chat TEXT, ts REAL, symbol TEXT, text TEXT, score REAL);
             CREATE TABLE IF NOT EXISTS outcomes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, symbol TEXT, kind TEXT,
                 label TEXT, direction INTEGER, p0 REAL, p1h REAL, p1d REAL, t0 REAL);
@@ -40,19 +44,53 @@ class Store:
         self.db.execute("DELETE FROM filings WHERE ts < ?", (cutoff,))
         self.db.execute("DELETE FROM events WHERE ts < ?", (cutoff,))
         self.db.execute("DELETE FROM pending WHERE ts < ?", (cutoff,))
+        self.db.execute("DELETE FROM upending WHERE ts < ?", (cutoff,))
         self.db.commit()
 
-    # --- watchlist ---------------------------------------------------------
-    def watch_add(self, symbol: str) -> None:
-        self.db.execute("INSERT OR IGNORE INTO watch VALUES (?)", (symbol.upper(),))
+    # --- users ---------------------------------------------------------------
+    def user_add(self, chat: str, name: str) -> bool:
+        """Registers a new user. True if they are new."""
+        cur = self.db.execute("INSERT OR IGNORE INTO users VALUES (?, ?, ?, 'active')", (str(chat), name, time.time()))
+        self.db.commit()
+        return cur.rowcount == 1
+
+    def user_status(self, chat: str):
+        row = self.db.execute("SELECT status FROM users WHERE chat = ?", (str(chat),)).fetchone()
+        return row[0] if row else None
+
+    def user_set_status(self, chat: str, status: str) -> None:
+        self.db.execute("UPDATE users SET status = ? WHERE chat = ?", (status, str(chat)))
         self.db.commit()
 
-    def watch_remove(self, symbol: str) -> None:
-        self.db.execute("DELETE FROM watch WHERE symbol = ?", (symbol.upper(),))
+    def users(self, status: str = "active") -> list:
+        return [(c, n) for c, n in self.db.execute(
+            "SELECT chat, name FROM users WHERE status = ? ORDER BY joined", (status,))]
+
+    def migrate_single_user(self, owner: str) -> None:
+        """Older versions had one portfolio/mute list/queue; they belong to the owner."""
+        if self.get("migrated_multiuser"):
+            return
+        self.db.execute("INSERT OR IGNORE INTO uwatch SELECT ?, symbol FROM watch", (owner,))
+        self.db.execute("INSERT OR IGNORE INTO umuted SELECT ?, symbol FROM muted", (owner,))
+        self.db.execute("INSERT INTO upending SELECT ?, ts, symbol, text, score FROM pending", (owner,))
+        self.db.execute("DELETE FROM pending")
+        for k, v in self.db.execute("SELECT k, v FROM kv WHERE k LIKE 'cfg:%'").fetchall():
+            if k.count(":") == 1:  # old global setting -> owner's setting
+                self.db.execute("INSERT OR IGNORE INTO kv VALUES (?, ?)", (f"cfg:{owner}:{k[4:]}", v))
+        self.db.commit()
+        self.set("migrated_multiuser", "1")
+
+    # --- per-user portfolio / mutes ---------------------------------------------
+    def watch_add(self, symbol: str, chat: str = "") -> None:
+        self.db.execute("INSERT OR IGNORE INTO uwatch VALUES (?, ?)", (str(chat), symbol.upper()))
         self.db.commit()
 
-    def watchlist(self) -> list:
-        return [r[0] for r in self.db.execute("SELECT symbol FROM watch ORDER BY symbol")]
+    def watch_remove(self, symbol: str, chat: str = "") -> None:
+        self.db.execute("DELETE FROM uwatch WHERE chat = ? AND symbol = ?", (str(chat), symbol.upper()))
+        self.db.commit()
+
+    def watchlist(self, chat: str = "") -> list:
+        return [r[0] for r in self.db.execute("SELECT symbol FROM uwatch WHERE chat = ? ORDER BY symbol", (str(chat),))]
 
     # --- key/value ---------------------------------------------------------
     def get(self, k: str, default=None):
@@ -104,27 +142,30 @@ class Store:
         cols = ["ts", "symbol", "kind", "headline", "tone", "impact", "source", "url"]
         return [dict(zip(cols, r)) for r in cur.fetchall()]
 
-    # --- digest queue: things worth knowing but not worth a ping right now ---
-    def queue(self, symbol: str, text: str, score: float = 0) -> None:
-        self.db.execute("INSERT INTO pending VALUES (?, ?, ?, ?)", (time.time(), symbol or "", text, score))
+    # --- digest queue (per user): worth knowing but not worth a ping right now ---
+    def queue(self, symbol: str, text: str, score: float = 0, chat: str = "") -> None:
+        self.db.execute("INSERT INTO upending VALUES (?, ?, ?, ?, ?)", (str(chat), time.time(), symbol or "", text, score))
         self.db.commit()
 
-    def take_queue(self) -> list:
-        rows = self.db.execute("SELECT ts, symbol, text, score FROM pending ORDER BY score DESC, ts").fetchall()
-        self.db.execute("DELETE FROM pending")
+    def take_queue(self, chat: str = "") -> list:
+        rows = self.db.execute("SELECT ts, symbol, text, score FROM upending WHERE chat = ? "
+                               "ORDER BY score DESC, ts", (str(chat),)).fetchall()
+        self.db.execute("DELETE FROM upending WHERE chat = ?", (str(chat),))
         self.db.commit()
         return rows
 
-    # --- muted stocks -------------------------------------------------------
-    def mute(self, symbol: str, on: bool = True) -> None:
+    def has_queue(self, chat: str = "") -> bool:
+        return self.db.execute("SELECT 1 FROM upending WHERE chat = ? LIMIT 1", (str(chat),)).fetchone() is not None
+
+    def mute(self, symbol: str, on: bool = True, chat: str = "") -> None:
         if on:
-            self.db.execute("INSERT OR IGNORE INTO muted VALUES (?)", (symbol.upper(),))
+            self.db.execute("INSERT OR IGNORE INTO umuted VALUES (?, ?)", (str(chat), symbol.upper()))
         else:
-            self.db.execute("DELETE FROM muted WHERE symbol = ?", (symbol.upper(),))
+            self.db.execute("DELETE FROM umuted WHERE chat = ? AND symbol = ?", (str(chat), symbol.upper()))
         self.db.commit()
 
-    def muted(self) -> set:
-        return {r[0] for r in self.db.execute("SELECT symbol FROM muted")}
+    def muted(self, chat: str = "") -> set:
+        return {r[0] for r in self.db.execute("SELECT symbol FROM umuted WHERE chat = ?", (str(chat),))}
 
     def count_today(self, prefix: str, day: str) -> int:
         return self.db.execute("SELECT COUNT(*) FROM seen WHERE key LIKE ?", (f"{prefix}:{day}:%",)).fetchone()[0]
