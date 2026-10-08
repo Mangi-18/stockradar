@@ -8,6 +8,8 @@ import logging
 import time
 from datetime import date
 
+from urllib.parse import quote, urlencode
+
 import requests
 
 log = logging.getLogger("nse")
@@ -38,10 +40,12 @@ class NSE:
     def get(self, path: str, params: dict = None):
         if time.time() - self._cookies_at > 240:  # refresh cookies every ~4 min
             self._warm()
-        r = self.s.get(BASE + path, params=params, timeout=self.timeout)
+        # NSE wants spaces as %20 ("NIFTY%2050"); requests would send "NIFTY+50", which NSE answers with 404.
+        url = BASE + path + ("?" + urlencode(params, quote_via=quote) if params else "")
+        r = self.s.get(url, timeout=self.timeout)
         if r.status_code in (401, 403):
             self._warm()
-            r = self.s.get(BASE + path, params=params, timeout=self.timeout)
+            r = self.s.get(url, timeout=self.timeout)
         r.raise_for_status()
         return r.json()
 
