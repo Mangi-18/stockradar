@@ -297,6 +297,69 @@ def test_settings_commands_persist():
     M.config.OPP_MAX_PER_DAY = 5; M.config.QUIET_START = M.config.QUIET_END = 0
 
 
+# ---------------------------------------------------------------- AI reasoning + learning
+from radar.ai import AIReader, parse_json  # noqa: E402
+
+
+def test_parse_ai_json_is_defensive():
+    d = parse_json('```json\n{"relevant": true, "priced_in": false, "impacts": ['
+                   '{"symbol": "jsw steel", "direction": "UP", "magnitude": "large", "confidence": 1.4, "why": "x"},'
+                   '{"symbol": "", "direction": "up"}, {"symbol": "ABC", "direction": "sideways"}]}\n```')
+    assert d["relevant"] and len(d["impacts"]) == 1
+    assert d["impacts"][0]["symbol"] == "JSWSTEEL" and d["impacts"][0]["confidence"] == 1.0
+    assert AIReader("AIzaXYZ").provider == "gemini" and AIReader("gsk_1").provider == "groq"
+    assert AIReader("").provider == ""
+
+
+def test_ai_second_order_reaches_portfolio():
+    r = make_radar(["JSWSTEEL"])
+    r.names.update({"JSWSTEEL": "JSW Steel Limited", "MARUTI": "Maruti Suzuki India Limited"})
+    r.rebuild_matcher()
+    r.ai.key = "AIzaTEST"
+    calls = []
+
+    def fake_read(headline, source, portfolio):
+        calls.append(headline)
+        return {"relevant": True, "priced_in": False, "impacts": [
+            {"symbol": "JSWSTEEL", "direction": "up", "magnitude": "large", "confidence": 0.8,
+             "order": "second-order", "why": "costlier imports let domestic mills raise prices"},
+            {"symbol": "MARUTI", "direction": "down", "magnitude": "small", "confidence": 0.6,
+             "order": "second-order", "why": "higher steel input costs"},
+            {"symbol": "FAKECO", "direction": "up", "magnitude": "large", "confidence": 0.9,
+             "order": "direct", "why": "made up"}]}
+    r.ai.read = fake_read
+    r.handle_headline("Government raises safeguard duty on steel imports to 20%", "PIB", "")
+    assert calls, "policy headline should be sent to the AI"
+    port = [m for m in r.sent if "JSWSTEEL" in m and "🤖" in m]
+    assert port and "↑" in port[0] and "domestic mills" in port[0], r.sent
+    assert not r.store.events_for("FAKECO")            # invented symbols are dropped
+    assert any(e["kind"] == "ai" for e in r.store.events_for("MARUTI"))
+    kinds = {(row[0], row[1]) for row in r.store.db.execute("SELECT symbol, label FROM outcomes")}
+    assert ("JSWSTEEL", "AI large") in kinds         # tracked for learning
+
+
+def test_ai_skipped_without_key_and_for_noise():
+    r = make_radar(["TCS"])
+    r.ai.read = lambda *a: (_ for _ in ()).throw(AssertionError("should not call AI"))
+    r.handle_headline("TCS wins $2 bn deal", "ET", "")      # no key -> no AI call, normal alert still works
+    assert any("TCS" in m for m in r.sent)
+
+
+def test_learning_stats_and_feedback():
+    r = make_radar()
+    for i in range(12):
+        r.store.track(f"S{i}", "filing", "Order win", 1)
+    for oid, *_ in r.store.outcomes_pending(40):
+        r.store.outcome_set(oid, "p0", 100); r.store.outcome_set(oid, "t0", 0)
+        r.store.outcome_set(oid, "p1h", 101); r.store.outcome_set(oid, "p1d", 104 if oid % 4 else 97)
+    st = {(x["kind"], x["label"]): x for x in r.store.outcome_stats()}
+    row = st[("filing", "Order win")]
+    assert row["n1d"] == 12 and row["hit1d"] == 9
+    r.stats = st
+    adj, why = r.learned_adjust([{"kind": "filing", "headline": "Order win: bags Rs 500 cr order"}])
+    assert adj == 10 and "75%" in why
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

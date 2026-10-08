@@ -17,6 +17,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from . import config
+from .ai import AIReader
 from .bse import BSE
 from .classify import HIGH, MEDIUM, classify
 from .news import (DEFAULT_FEEDS, NewsFeeds, analyse_headline, build_market_matcher,
@@ -64,6 +65,24 @@ def pct(v) -> str:
     return "n/a" if v is None else f"{v:+.1f}%"
 
 
+def event_label(e: dict) -> str:
+    """The label a tracked signal was stored under (see Store.track calls)."""
+    k, h = e["kind"], e["headline"]
+    if k == "filing":
+        return h.split(":")[0]
+    if k == "ai":
+        m = re.search(r"\b(small|medium|large)\b", h)
+        return f"AI {m.group(1)}" if m else "AI"
+    if k == "results":
+        m = re.match(r"Q results (.+?) \(", h)
+        return m.group(1) if m else "results"
+    if k == "insider":
+        return "promoter buy"
+    if k == "deal":
+        return "bulk/block buy"
+    return classify(h)["label"]
+
+
 class Radar:
     def __init__(self):
         self.store = Store(config.DB_PATH)
@@ -73,6 +92,9 @@ class Radar:
         self.universe = set()        # index stocks we scan for prices (not alerted by default)
         self.failures = {}
         self.last_error = {}
+        self.last_price = {}         # symbol -> latest price seen (for outcome tracking)
+        self.stats, self._stats_at = {}, 0.0
+        self._ai_cycle = 0
         self.result_tries = {}
         self.warmed_up = set()
         self.names = {}              # symbol -> company name
@@ -85,6 +107,8 @@ class Radar:
         if self.store.get("initialized"):
             self.warmed_up = {"nse", "bse", "results", "insider", "deals"}
         self.apply_saved_settings()
+        self.ai = AIReader(self.store.get("ai_key") or config.AI_KEY, config.AI_MAX_PER_DAY)
+        self.ai.model = config.AI_MODEL
 
     # ================================================================== lists
     def portfolio(self) -> set:
@@ -145,7 +169,12 @@ class Radar:
         evidence from the last 24 h and decide: ping, digest, or stay silent."""
         if not sym or sym in self.portfolio() or sym in self.store.muted():
             return
-        s = score_events(self.store.events_for(sym, 24), self.day_change.get(sym))
+        evs = self.store.events_for(sym, 24)
+        s = score_events(evs, self.day_change.get(sym))
+        adj, why = self.learned_adjust(evs)
+        if adj:
+            s["score"] = max(0, min(100, s["score"] + adj))
+            s["reasons"].append(why)
         day = now().strftime("%Y-%m-%d")
         if s["score"] >= config.OPP_MIN_SCORE and not quiet_hours(now()):
             used = self.store.count_today("opp", day)
@@ -216,6 +245,8 @@ class Radar:
         self.store.add_filing(sym, it["headline"][:200], c["impact"], it["url"])
         self.store.log_event(sym, "filing", f"{c['label']}: {it['headline'][:250]}", c["tone"],
                              c["impact"], it["exchange"], it["url"])
+        if not silent and c["impact"] == HIGH and c["tone"] in "+-":
+            self.store.track(sym, "filing", c["label"], 1 if c["tone"] == "+" else -1)
         if silent or c["impact"] not in (HIGH, MEDIUM):
             return
         if sym in self.portfolio():
@@ -261,6 +292,8 @@ class Radar:
             self.store.set(key, "done")
             if not a.get("ok"):
                 continue
+            if a["score"]:
+                self.store.track(sym, "results", a["verdict"], 1 if a["score"] > 0 else -1)
             if sym in self.portfolio():
                 self.notify(sym, self.format_result(sym, kind, a), urgent=True)
             else:
@@ -318,6 +351,7 @@ class Radar:
             except (TypeError, ValueError):
                 continue
             self.day_change[sym] = chg
+            self.last_price[sym] = price
             try:
                 vol = float(r.get("totalTradedVolume") or 0)
             except (TypeError, ValueError):
@@ -423,6 +457,7 @@ class Radar:
                                  f"{esc(r.get('acqMode') or 'market')}", urgent=True)
             elif buy:
                 self.store.log_event(sym, "insider", what, "+", HIGH, "NSE")
+                self.store.track(sym, "insider", "promoter buy", 1)
                 self.consider(sym)
         self.warmed_up.add("insider")
 
@@ -453,11 +488,13 @@ class Radar:
                 self.notify(sym, f"🐋 <b>⭐ {esc(sym)}</b> · {esc(what)}")
             elif side == "BUY":
                 self.store.log_event(sym, "deal", what, "+", MEDIUM, "NSE")
+                self.store.track(sym, "deal", "bulk/block buy", 1)
                 self.consider(sym)
         self.warmed_up.add("deals")
 
     # ================================================================== news
     def poll_news(self) -> None:
+        self._ai_cycle = 0
         first = "news" not in self.warmed_up
         for url, items in self.news.fetch():
             host = re.sub(r"^https?://(www\.)?", "", url).split("/")[0]
@@ -474,49 +511,149 @@ class Radar:
                 self.handle_headline(title, src, it["link"])
         self.warmed_up.add("news")
 
+    POLICY = re.compile(r"government|ministry|cabinet|\brbi\b|sebi|duty|tariff|\bban\b|policy|scheme|subsid|"
+                        r"\btax|gst|import|export|price (hike|cut)|approv|crude|opec|monsoon|order|contract|"
+                        r"acqui|merger|stake|probe|raid|downgrade|upgrade|recall|strike|shortage", re.I)
+
+    def wants_ai(self, a, c, syms, mine) -> bool:
+        if not self.ai.provider or a["already_moved"]:
+            return False
+        # Each AI read takes a few seconds; cap per news cycle so filings/prices never wait long.
+        if self._ai_cycle >= 6 and not mine:
+            return False
+        self._ai_cycle += 1
+        return bool(mine or a["themes"] or (a["global"] and a["dramatic"])
+                    or (syms and c["impact"] == HIGH) or self.POLICY.search(a.get("_title", "")))
+
     def handle_headline(self, title: str, src: str, link: str, _unused=None) -> None:
         a = analyse_headline(title, self.matcher, self.market_matcher)
+        a["_title"] = title
         c = classify(title)
         t = a["tone"] if a["tone"] != "?" else c["tone"]
-        if a["already_moved"]:
-            title_logged = title + " (already moving)"
-            label = "⏱️ already moving"
-        else:
-            title_logged, label = title, (c["label"] if c["label"] != "Other" else "News")
-        impact = c["impact"] if c["impact"] != "LOW" or t == "?" else MEDIUM  # clearly toned news counts
-        stamp = f"<i>{esc(src)} · {now().strftime('%d %b %H:%M')}</i>" + (
-            f'\n<a href="{esc(link)}">Read</a>' if link else "")
         mine_set = self.portfolio()
         syms = a["stocks"] + a["others"]
         mine = [s for s in syms if s in mine_set]
 
+        # --- AI reasoning: who is affected, which way, and why (incl. second-order effects)
+        ai_imp = []
+        if self.wants_ai(a, c, syms, mine):
+            ai = self.ai.read(title, src, sorted(mine_set))
+            if ai:
+                if ai["priced_in"]:
+                    a["already_moved"] = True
+                if ai["relevant"]:
+                    # guard against made-up symbols: keep only real NSE symbols
+                    ai_imp = [i for i in ai["impacts"] if i["confidence"] >= 0.5
+                              and (i["symbol"] in self.names or i["symbol"] in mine_set)]
+        ai_by = {i["symbol"]: i for i in ai_imp}
+
+        if a["already_moved"]:
+            title_logged, label = title + " (already moving)", "⏱️ already moving"
+        else:
+            title_logged, label = title, (c["label"] if c["label"] != "Other" else "News")
+        impact = c["impact"] if c["impact"] != "LOW" or t == "?" else MEDIUM
+        stamp = f"<i>{esc(src)} · {now().strftime('%d %b %H:%M')}</i>" + (
+            f'\n<a href="{esc(link)}">Read</a>' if link else "")
+
         for s in syms:
             self.store.log_event(s, "news", title_logged, t, impact, src, link)
             self.store.add_filing(s, "News: " + title[:180], impact, link)
+            if impact == HIGH and t in "+-" and s not in ai_by and not a["already_moved"]:
+                self.store.track(s, "news", c["label"], 1 if t == "+" else -1)
+        for i in ai_imp:
+            s, up = i["symbol"], i["direction"] == "up"
+            strong = i["magnitude"] == "large" and i["confidence"] >= 0.7
+            self.store.log_event(s, "ai", f"AI: {'↑' if up else '↓'} {i['magnitude']} ({i['confidence']:.0%}) — "
+                                 f"{i['why']} [{title[:120]}]", "+" if up else "-", HIGH if strong else MEDIUM, src, link)
+            self.store.add_filing(s, f"AI: {i['why']}", HIGH if strong else MEDIUM, link)
+            if not a["already_moved"]:
+                self.store.track(s, "ai", f"AI {i['magnitude']}", 1 if up else -1)
         for name, _ in a["themes"]:
             self.store.log_event("", "theme:" + name, title, t, "MEDIUM", src, link)
         if a["global"]:
             self.store.log_event("", "global", title, t, "MEDIUM", src, link)
 
-        for s in mine:
-            self.notify(s, f"📰 {TONE[t]} <b>⭐ {esc(s)}</b> · {esc(label)}\n{esc(title)}\n{stamp}",
-                        urgent=impact == HIGH and not a["already_moved"])
-        for s in syms:
+        # --- your portfolio: direct mentions + stocks the AI says are affected
+        for s in mine + [s for s in ai_by if s in mine_set and s not in mine]:
+            i = ai_by.get(s)
+            tone_s = ("+" if i["direction"] == "up" else "-") if i else t
+            ai_line = (f"\n🤖 {'↑' if i['direction'] == 'up' else '↓'} {i['magnitude']} impact likely "
+                       f"({i['confidence']:.0%}, {i['order']}): {esc(i['why'])}") if i else ""
+            urgent = not a["already_moved"] and (impact == HIGH or bool(
+                i and i["magnitude"] in ("medium", "large") and i["confidence"] >= 0.7))
+            self.notify(s, f"📰 {TONE[tone_s]} <b>⭐ {esc(s)}</b> · {esc(label)}\n{esc(title)}{ai_line}\n{stamp}",
+                        urgent=urgent)
+        for s in set(syms) | set(ai_by):
             if s not in mine_set:
                 self.consider(s)
 
+        # --- sector / policy news
         if a["themes"] and config.NEWS_THEMES and not a["already_moved"]:
             name, exposed = a["themes"][0]
-            hit = [s for s in exposed if s in mine_set]
-            msg = (f"🧭 <b>Sector news · {esc(name)}</b>\n{esc(title)}\n"
-                   + (f"Affects your: <b>{esc(', '.join(hit))}</b>\n" if hit else
-                      f"Most exposed: {esc(', '.join(exposed[:6]))}\n") + stamp)
+            hit = [s for s in set(exposed) | set(ai_by) if s in mine_set]
+            if ai_by:
+                who = ", ".join(f"{s} {'↑' if i['direction'] == 'up' else '↓'}" for s, i in ai_by.items())
+                body = f"🤖 Likely impact: {esc(who)}\n" + "".join(
+                    f"   • {esc(s)}: {esc(i['why'])}\n" for s, i in list(ai_by.items())[:3])
+            else:
+                body = f"Most exposed: {esc(', '.join(exposed[:6]))}\n"
+            msg = (f"🧭 <b>Sector news · {esc(name)}</b>\n{esc(title)}\n" + body
+                   + (f"Affects your: <b>{esc(', '.join(hit))}</b>\n" if hit else "") + stamp)
             if hit and not quiet_hours(now()) and self.store.first_time(f"theme:{name}:{int(time.time() // 3600)}"):
                 self.tg.send(msg)
             else:
                 self.store.queue("", msg, 30)
         elif a["global"] and a["dramatic"] and self.store.first_time(f"global:{int(time.time() // 3600)}"):
             self.tg.send(f"🌍 <b>Global cue</b>\n{esc(title)}\n{stamp}")
+
+    # ================================================================== learning
+    def poll_outcomes(self) -> None:
+        """Record the price when a signal fired, 1 hour later and 1 trading day later."""
+        now_ts = time.time()
+        quotes = 0
+        for oid, ts, sym, p0, p1h, p1d, t0 in self.store.outcomes_pending(40):
+            if p0 and p1h and not p1d and now_ts - t0 < 18 * 3600:
+                continue
+            if p0 and not p1h and now_ts - t0 < 3600:
+                continue
+            price = self.last_price.get(sym)
+            if price is None:
+                if quotes >= 15:
+                    continue
+                try:
+                    price = float(self.nse.quote(sym)["lastPrice"])
+                    quotes += 1
+                    time.sleep(0.8)
+                except Exception:
+                    continue
+            if not p0:
+                self.store.outcome_set(oid, "p0", price)
+                self.store.outcome_set(oid, "t0", now_ts)
+            elif not p1h:
+                self.store.outcome_set(oid, "p1h", price)
+            elif now_ts - t0 >= 18 * 3600:
+                self.store.outcome_set(oid, "p1d", price)
+        if now_ts - self._stats_at > 3600:
+            self._stats_at = now_ts
+            self.stats = {(r["kind"], r["label"]): r for r in self.store.outcome_stats()}
+
+    def learned_adjust(self, events: list):
+        """Nudge the score by how this kind of signal has actually played out so far."""
+        best = None
+        for e in events:
+            key = (e["kind"], event_label(e))
+            st = self.stats.get(key)
+            if st and st["n1d"] >= 10:
+                best = (key, st)
+        if not best:
+            return 0, None
+        (kind, label), st = best
+        hit = st["hit1d"] / st["n1d"]
+        if hit >= 0.6:
+            return 10, f"+10 '{label}' signals worked {hit:.0%} of the time so far (n={st['n1d']})"
+        if hit < 0.45:
+            return -10, f"-10 '{label}' signals worked only {hit:.0%} of the time so far (n={st['n1d']})"
+        return 0, None
 
     # ================================================================== briefs & digests
     def last_close(self, t: datetime) -> datetime:
@@ -736,6 +873,31 @@ class Radar:
             elif cmd == "/digest":
                 self.send_digest("Digest") if self.store.db.execute("SELECT 1 FROM pending LIMIT 1").fetchone() \
                     else self.tg.send("Nothing held back right now.")
+            elif cmd == "/setkey" and len(parts) >= 2:
+                key = parts[1].strip()
+                self.store.set("ai_key", key)
+                self.ai.key = key
+                prov = self.ai.provider
+                self.tg.send(f"✅ AI reasoning on ({prov}). Please delete your message that contains the key."
+                             if prov else "That doesn't look like a Gemini (AIza…) or Groq (gsk_…) key.")
+            elif cmd == "/ai":
+                self.ai.budget_left()
+                self.tg.send(f"🤖 AI reasoning: {self.ai.provider or 'off (send /setkey YOUR_KEY)'}\n"
+                             f"Headlines read today: {self.ai.calls_today}/{self.ai.max_per_day}"
+                             + (f"\nRecent errors: {self.ai.errors}" if self.ai.errors else ""))
+            elif cmd == "/learn":
+                rows = self.store.outcome_stats()
+                if not rows:
+                    self.tg.send("📊 Nothing measured yet. Each signal's price is checked 1 hour and 1 trading day "
+                                 "later; results appear after the first few days.")
+                else:
+                    out = ["📊 <b>What happened after each kind of signal</b>",
+                           "(hit = moved the predicted way; avg = average move in that direction)"]
+                    for r in rows[:15]:
+                        h1d = f"1d: hit {r['hit1d'] / r['n1d']:.0%}, avg {r['sum1d'] / r['n1d']:+.1f}% (n={r['n1d']})" if r["n1d"] else "1d: pending"
+                        h1h = f"1h: avg {r['sum1h'] / r['n1h']:+.1f}% (n={r['n1h']})" if r["n1h"] else ""
+                        out.append(f"• <b>{esc(r['label'])}</b> [{esc(r['kind'])}] {h1d} {h1h}")
+                    self.tg.send_long(out)
             elif cmd == "/settings":
                 self.tg.send(self.settings_text())
             elif cmd == "/set" and len(parts) >= 3:
@@ -754,7 +916,8 @@ class Radar:
                              "/mute SYM — never alert this stock\n/unmute SYM\n"
                              "/top — strongest candidates right now\n/brief [hours] — news summary\n"
                              "/digest — send held-back items now\n/settings — see limits\n/set NAME VALUE — change a limit (e.g. /set maxopp 15)\n"
-                             "/update — install the latest version\n/status")
+                             "/update — install the latest version\n/setkey KEY — turn on AI reasoning\n/ai — AI status\n"
+                             "/learn — how past signals actually played out\n/status")
 
     # ================================================================== health
     def ok(self, job: str) -> None:
@@ -785,7 +948,7 @@ class Radar:
         self.tg.send(f"🛰️ Stock Radar online · portfolio: {len(p)} stocks"
                      + ("" if p else " (send /add SYMBOL for each stock you own)")
                      + f" · max {config.OPP_MAX_PER_DAY} opportunity alerts/day. Send /help.")
-        nxt = dict.fromkeys(["filings", "results", "prices", "cmds", "news", "insider", "deals"], 0)
+        nxt = dict.fromkeys(["filings", "results", "prices", "cmds", "news", "insider", "deals", "outcomes"], 0)
         last_universe = last_prune = now().date()
         retry_universe = 0
         while True:
@@ -811,6 +974,8 @@ class Radar:
                 self.poll_deals()
             if market_open(t) and due("prices", config.PRICES_POLL):
                 self.poll_prices()
+            if market_open(t) and due("outcomes", 300):
+                self.poll_outcomes()
             if due("cmds", config.TELEGRAM_POLL):
                 self.handle_commands()
 

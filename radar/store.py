@@ -20,6 +20,9 @@ class Store:
             CREATE INDEX IF NOT EXISTS events_sym ON events(symbol, ts);
             CREATE TABLE IF NOT EXISTS pending (ts REAL, symbol TEXT, text TEXT, score REAL);
             CREATE TABLE IF NOT EXISTS muted (symbol TEXT PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS outcomes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, symbol TEXT, kind TEXT,
+                label TEXT, direction INTEGER, p0 REAL, p1h REAL, p1d REAL, t0 REAL);
         """)
         self.db.commit()
 
@@ -125,3 +128,40 @@ class Store:
 
     def count_today(self, prefix: str, day: str) -> int:
         return self.db.execute("SELECT COUNT(*) FROM seen WHERE key LIKE ?", (f"{prefix}:{day}:%",)).fetchone()[0]
+
+    # --- learning: what happened to the price after each signal ---------------
+    def track(self, symbol: str, kind: str, label: str, direction: int) -> None:
+        self.db.execute("INSERT INTO outcomes (ts, symbol, kind, label, direction) VALUES (?, ?, ?, ?, ?)",
+                        (time.time(), symbol, kind, label, direction))
+        self.db.commit()
+
+    def outcomes_pending(self, limit: int = 30) -> list:
+        """Rows still missing a price, oldest first (kept 5 days)."""
+        cutoff = time.time() - 5 * 86400
+        return self.db.execute(
+            "SELECT id, ts, symbol, p0, p1h, p1d, t0 FROM outcomes WHERE ts > ? AND "
+            "(p0 IS NULL OR p1h IS NULL OR p1d IS NULL) ORDER BY ts LIMIT ?", (cutoff, limit)).fetchall()
+
+    def outcome_set(self, oid: int, field: str, value: float) -> None:
+        assert field in ("p0", "p1h", "p1d", "t0")
+        self.db.execute(f"UPDATE outcomes SET {field} = ? WHERE id = ?", (value, oid))
+        self.db.commit()
+
+    def outcome_stats(self, min_n: int = 1) -> list:
+        """Per (kind, label): count, hit rate and average move IN THE PREDICTED DIRECTION."""
+        rows = self.db.execute(
+            "SELECT kind, label, direction, p0, p1h, p1d FROM outcomes WHERE p0 > 0 AND direction != 0").fetchall()
+        agg = {}
+        for kind, label, d, p0, p1h, p1d in rows:
+            a = agg.setdefault((kind, label), {"n1h": 0, "hit1h": 0, "sum1h": 0.0, "n1d": 0, "hit1d": 0, "sum1d": 0.0})
+            for p, tag in ((p1h, "1h"), (p1d, "1d")):
+                if p:
+                    move = (p - p0) / p0 * 100 * d
+                    a["n" + tag] += 1
+                    a["sum" + tag] += move
+                    a["hit" + tag] += move > 0
+        out = []
+        for (kind, label), a in agg.items():
+            if a["n1d"] >= min_n or a["n1h"] >= min_n:
+                out.append({"kind": kind, "label": label, **a})
+        return sorted(out, key=lambda x: -(x["n1d"] + x["n1h"]))

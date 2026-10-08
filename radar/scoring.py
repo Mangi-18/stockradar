@@ -17,16 +17,18 @@ import time
 
 KIND_BASE = {  # strongest single piece of evidence
     ("filing", "HIGH"): (40, "exchange filing"),
+    ("ai", "HIGH"): (35, "AI read: large expected impact"),
     ("results", "HIGH"): (40, "results far from last year"),
     ("insider", "HIGH"): (35, "promoter buying/selling"),
     ("news", "HIGH"): (30, "high-impact news"),
     ("deal", "MEDIUM"): (25, "bulk/block deal"),
     ("filing", "MEDIUM"): (20, "exchange filing"),
+    ("ai", "MEDIUM"): (20, "AI read: likely impact"),
     ("gap", "MEDIUM"): (15, "pre-open gap"),
     ("news", "MEDIUM"): (15, "news"),
     ("burst", "MEDIUM"): (10, "price burst"),
 }
-SIGNAL_KINDS = {"filing", "results", "insider", "news", "deal", "burst", "gap"}
+SIGNAL_KINDS = {"filing", "results", "insider", "news", "deal", "burst", "gap", "ai"}
 SIGN = {"+": 1, "-": -1, "?": 0}
 
 
@@ -54,7 +56,7 @@ def score_events(events: list, day_change: float = None, now: float = None) -> d
         score += bonus
         reasons.append(f"+{bonus} covered by {len(sources)} outlets")
 
-    kinds = {e["kind"] for e in ev}
+    kinds = {e["kind"] for e in ev if e["kind"] != "ai"}  # AI reads the same news; not independent evidence
     if len(kinds) > 1:
         bonus = min(24, 12 * (len(kinds) - 1))
         score += bonus

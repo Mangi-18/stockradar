@@ -30,6 +30,27 @@ revenue growth YoY, net-margin change, and loss↔profit swings. Every point is
 explained in the alert. It compares with last year, not analyst estimates, and
 it does not predict the price.
 
+## Understanding indirect news (AI reasoning)
+
+Headlines rarely say "this stock will rise". "Government raises steel import
+duty" means domestic steel makers can charge more (up) and steel buyers like
+carmakers pay more (down). With a free Gemini or Groq key (`/setkey`), the
+engine sends important headlines (your stocks, policy, sector, high-impact
+news) to an AI model that answers: which NSE companies are affected, including
+second-order effects, which direction, how big, how confident, and why. Your
+portfolio alerts then show a 🤖 line with that reasoning, and the result feeds
+the evidence score. Invented symbols are discarded; only real NSE symbols are
+kept. `/ai` shows how many headlines it read today.
+
+## Learning from what actually happened
+
+Every directional signal (filing, results, AI read, promoter buy, block deal,
+high-impact news) is recorded with the price when it fired, 1 hour later and 1
+trading day later. `/learn` shows, per kind of signal, how often the price
+moved the predicted way and by how much on average. Once a kind of signal has
+10+ measured cases, it nudges the evidence score: ±10 for signals that have
+worked (≥60%) or failed (<45%) so far.
+
 ## How it avoids spamming you
 
 | Who | What reaches you |
@@ -98,6 +119,8 @@ You'll get "🛰️ Stock Radar online" in Telegram.
 - `/status` — is it alive, opportunity alerts used today, failing sources
 - `/settings` — see all limits; `/set maxopp 15`, `/set score 60`, `/set cooldown 0`, `/set quiet off` change them instantly (no server login needed)
 - `/update` — install the latest version from GitHub and restart (after the one-time setup below)
+- `/setkey YOUR_KEY` — turn on AI reasoning (free key from aistudio.google.com/apikey or console.groq.com/keys); `/ai` shows its status
+- `/learn` — how each kind of signal actually played out so far
 
 ## One-time setup for one-tap updates
 

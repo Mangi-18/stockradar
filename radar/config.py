@@ -76,3 +76,8 @@ STOCK_COOLDOWN_MIN = _float("STOCK_COOLDOWN_MIN", 60)  # max one routine ping pe
 QUIET_START = int(_float("QUIET_START", 23))         # quiet hours (IST): only urgent portfolio alerts
 QUIET_END = int(_float("QUIET_END", 7))
 DIGEST_TIMES = [t.strip() for t in os.environ.get("DIGEST_TIMES", "12:30,15:45,20:30").split(",") if t.strip()]
+
+# --- AI reasoning (free Gemini or Groq key; can also be set from Telegram with /setkey) ---
+AI_KEY = os.environ.get("AI_KEY", "")
+AI_MODEL = os.environ.get("AI_MODEL", "")          # empty = provider default
+AI_MAX_PER_DAY = int(_float("AI_MAX_PER_DAY", 400))  # stays inside free-tier daily limits
