@@ -1557,6 +1557,14 @@ class Radar:
             self.fail("universe", e)
         self.tg.set_menu(self.MENU)
         n = len(self.store.users("active"))
+        # When the button panel changes, give everyone the new one once (their old panel stays otherwise)
+        panel_id = "|".join("/".join(r) for r in self.PANEL)
+        if self.store.get("panel_id") != panel_id:
+            self.store.set("panel_id", panel_id)
+            for u in self.users():
+                if not u.is_owner:
+                    u.send("🆕 New buttons: ✅ High certainty, and ⭐ Portfolio now shows each stock's overall verdict.",
+                           reply_keyboard=self.PANEL)
         self.owner.send(f"🛰️ Stock Radar online · {n} {'person' if n == 1 else 'people'} using it · "
                         f"your portfolio: {len(self.owner.portfolio())} stocks.", reply_keyboard=self.PANEL)
         nxt = dict.fromkeys(["filings", "results", "prices", "cmds", "news", "insider", "deals", "outcomes", "channels"], 0)
