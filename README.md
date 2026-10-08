@@ -127,7 +127,15 @@ journalctl -u stockradar -f            # live logs
 ```
 You'll get "🛰️ Stock Radar online" in Telegram.
 
-## Telegram commands
+## Using it: buttons, no typing
+
+- **Button panel** below the typing box: 🎯 Top · 🗞️ Brief · ⭐ Portfolio · 🤖 Ask AI · ⚙️ Settings · 📥 Digest · 📊 Learn · 🩺 Status · ☰ More
+- **☰ Menu** button next to the typing box lists every function with a short description
+- **Settings** are ➕ / ➖ buttons; **Portfolio** has ❌ buttons to remove and ➕ Add stocks
+- Every ⚡ / 🎯 / 📣 alert has **➕ Add to portfolio** and **🔇 Mute** buttons
+- **Paste any headline** as a message and the AI tells you which stocks it likely moves
+
+## Telegram commands (still work if you prefer typing)
 - `/add TCS HAL IRFC` — add stocks to your portfolio
 - `/remove IRFC`
 - `/list` — your portfolio and muted stocks

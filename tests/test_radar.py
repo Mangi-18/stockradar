@@ -82,7 +82,10 @@ def make_radar(portfolio=()):
     M.config.DB_PATH = os.path.join(tempfile.mkdtemp(), "t.db")  # fresh state per test
     r = M.Radar()
     r.sent = []
-    r.tg.send = lambda m: r.sent.append(m) or True
+    r.tg.send = lambda m, *a, **k: r.sent.append(m) or True
+    r.buttons = []
+    r.tg.edit = lambda mid, m, b=None: r.sent.append(m)
+    r.tg.answer = lambda cid, text="": r.sent.append("toast:" + text)
     r.tg.send_long = lambda lines: r.sent.append("\n".join(lines))
     for p in portfolio:
         r.store.watch_add(p)
@@ -444,6 +447,47 @@ def test_breaking_from_exchange_filing():
                      "category": "", "url": "http://f", "exchange": "NSE"})
     brk = [m for m in r.sent if "BREAKING" in m]
     assert len(brk) == 1 and "TINYCO" in brk[0] and "NSE filing" in brk[0]
+
+
+def test_buttons_settings_portfolio_and_alert_actions():
+    r = make_radar(["TCS"])
+    sent_buttons = []
+    r.tg.send = lambda m, buttons=None, reply_keyboard=None: (r.sent.append(m), sent_buttons.append(buttons or reply_keyboard))
+    # panel button text maps to a command
+    r.tg.commands = lambda: [{"type": "text", "text": "⚙️ Settings"}]
+    r.handle_commands()
+    assert "Settings" in r.sent[-1] and any("Opportunities/day" in b[1][0] for b in sent_buttons[-1] if len(b) == 3)
+    # tap ➕ on max opportunities
+    before = M.config.OPP_MAX_PER_DAY
+    r.tg.commands = lambda: [{"type": "tap", "data": "set:maxopp:+", "id": "1", "msg_id": 5}]
+    r.handle_commands()
+    assert M.config.OPP_MAX_PER_DAY == before + 1
+    M.config.OPP_MAX_PER_DAY = before
+    # add via prompt then typed symbols
+    r.tg.commands = lambda: [{"type": "tap", "data": "prompt:add", "id": "2", "msg_id": 6},
+                             {"type": "text", "text": "hal irfc"}]
+    r.handle_commands()
+    assert {"HAL", "IRFC"} <= r.portfolio()
+    # remove by tapping ❌
+    r.tg.commands = lambda: [{"type": "tap", "data": "rm:IRFC", "id": "3", "msg_id": 7}]
+    r.handle_commands()
+    assert "IRFC" not in r.portfolio()
+    # add/mute straight from an alert button
+    r.tg.commands = lambda: [{"type": "tap", "data": "add:ZENTEC", "id": "4", "msg_id": 8},
+                             {"type": "tap", "data": "mute:GPIL", "id": "5", "msg_id": 9}]
+    r.handle_commands()
+    assert "ZENTEC" in r.portfolio() and "GPIL" in r.store.muted()
+
+
+def test_pasted_headline_goes_to_ai():
+    r = make_radar()
+    r.ai.key = "AQ.test"
+    r.ai.read = lambda q, src, port: {"relevant": True, "priced_in": False, "impacts": [
+        {"symbol": "ONGC", "direction": "down", "magnitude": "medium", "confidence": 0.7,
+         "order": "direct", "why": "lower crude"}]}
+    r.tg.commands = lambda: [{"type": "text", "text": "Crude falls 6% after OPEC raises output"}]
+    r.handle_commands()
+    assert "ONGC" in r.sent[-1]
 
 
 if __name__ == "__main__":

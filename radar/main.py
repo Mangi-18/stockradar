@@ -96,6 +96,7 @@ class Radar:
         self.stats, self._stats_at = {}, 0.0
         self._ai_cycle = 0
         self._ai_filing_cycle = 0
+        self.awaiting = None         # what the next typed message means ("add", "ask", "setkey")
         self.result_tries = {}
         self.warmed_up = set()
         self.names = {}              # symbol -> company name
@@ -182,7 +183,7 @@ class Radar:
             if (used < config.OPP_MAX_PER_DAY and not self.store.has_seen(f"story:{day}:{sym}:sent")
                     and not self.store.has_seen(f"brk:{day}:{sym}")
                     and self.store.first_time(f"opp:{day}:{sym}")):
-                self.tg.send(self.format_opportunity(sym, s, used + 1))
+                self.tg.send(self.format_opportunity(sym, s, used + 1), buttons=self.stock_buttons(sym))
                 return
         if s["score"] >= config.OPP_DIGEST_SCORE and self.store.first_time(f"oppq:{day}:{sym}"):
             self.store.queue(sym, self.format_candidate(sym, s), s["score"])
@@ -195,7 +196,7 @@ class Radar:
                  "<b>Latest evidence</b>",
                  *[f"• {TONE.get(e['tone'], '🟡')} {esc(e['headline'][:150])} <i>({esc(e['source'] or e['kind'])})</i>"
                    for e in reversed(ev)],
-                 "<i>Score = strength of evidence, not a guarantee. /add to track it, /mute to silence it.</i>"]
+                 "<i>Score = strength of evidence, not a guarantee.</i>"]
         return "\n".join(lines)
 
     def format_candidate(self, sym, s) -> str:
@@ -663,8 +664,8 @@ class Radar:
         if link:
             lines.append(f'<a href="{esc(link)}">Source</a>')
         lines.append(f"<i>Single source, not yet confirmed by other outlets. Breaking {n} of "
-                     f"{config.BREAKING_MAX_PER_DAY} today · /add {esc(sym)} · /mute {esc(sym)}</i>")
-        self.tg.send("\n".join(lines))
+                     f"{config.BREAKING_MAX_PER_DAY} today.</i>")
+        self.tg.send("\n".join(lines), buttons=self.stock_buttons(sym))
 
     def story_check(self, sym: str, title: str, src: str, ai_i, moved: bool) -> None:
         """📣 A stock outside your portfolio is being covered by several outlets at once.
@@ -705,8 +706,8 @@ class Radar:
         elif dc is not None:
             lines.append(f"Price today so far: {dc:+.1f}%")
         lines += [f"• {esc(h[:140])} <i>({esc(o)})</i>" for o, h in outlets[:4]]
-        lines.append(f"<i>Story alert {n} of {config.STORY_MAX_PER_DAY} today · /add {esc(sym)} to track · /mute {esc(sym)} to silence</i>")
-        self.tg.send("\n".join(lines))
+        lines.append(f"<i>Story alert {n} of {config.STORY_MAX_PER_DAY} today.</i>")
+        self.tg.send("\n".join(lines), buttons=self.stock_buttons(sym))
 
     # ================================================================== learning
     def poll_outcomes(self) -> None:
@@ -941,113 +942,253 @@ class Radar:
         self.tg.send("⬇️ Updated. Restarting in a few seconds…\n" + esc(log))
         sys.exit(0)  # systemd (or run.sh on Termux) restarts the engine with the new code
 
+    # ================================================================== buttons & menu
+    MENU = [("menu", "Show the button panel"), ("portfolio", "Your stocks: view, add, remove"),
+            ("top", "Strongest candidates right now"), ("brief", "News summary (pick hours)"),
+            ("digest", "Get held-back items now"), ("ask", "Ask the AI about any headline"),
+            ("settings", "Change limits with ➕ / ➖ buttons"), ("learn", "How past signals played out"),
+            ("ai", "AI status"), ("status", "Health check"), ("update", "Install the latest version")]
+    PANEL = [["🎯 Top", "🗞️ Brief", "⭐ Portfolio"], ["🤖 Ask AI", "⚙️ Settings", "📥 Digest"],
+             ["📊 Learn", "🩺 Status", "☰ More"]]
+    PANEL_MAP = {"🎯 Top": "/top", "🗞️ Brief": "/brief", "⭐ Portfolio": "/portfolio", "🤖 Ask AI": "/ask",
+                 "⚙️ Settings": "/settings", "📥 Digest": "/digest", "📊 Learn": "/learn",
+                 "🩺 Status": "/status", "☰ More": "/more"}
+    STEPS = {  # setting -> (button label, step, min, max)
+        "maxopp": ("🎯 Opportunities/day", 1, 0, 50), "score": ("🎯 Min evidence score", 5, 30, 95),
+        "digestscore": ("📋 Digest min score", 5, 0, 90), "cooldown": ("⏱ Cooldown min", 15, 0, 240),
+        "burst": ("🚀 Burst % in 5 min", 0.5, 0.5, 5), "gap": ("🌅 Pre-open gap %", 0.5, 0.5, 10),
+        "outlets": ("📣 Outlets for story", 1, 1, 6), "maxstory": ("📣 Stories/day", 1, 0, 50),
+        "breakconf": ("⚡ Breaking confidence", 0.05, 0.5, 0.95), "maxbreak": ("⚡ Breaking/day", 1, 0, 50)}
+
+    def stock_buttons(self, sym: str):
+        return [[(f"➕ Add {sym} to portfolio", f"add:{sym}"), (f"🔇 Mute {sym}", f"mute:{sym}")]]
+
+    def settings_view(self):
+        rows = []
+        for name, (label, *_r) in self.STEPS.items():
+            val = getattr(config, self.SETTINGS[name][0])
+            rows.append([("➖", f"set:{name}:-"), (f"{label}: {val:g}", "noop"), ("➕", f"set:{name}:+")])
+        quiet = "off" if config.QUIET_START == config.QUIET_END else f"{config.QUIET_START}:00–{config.QUIET_END}:00"
+        rows.append([(f"🌙 Quiet hours: {quiet} (tap to switch)", "quiet:toggle")])
+        return "⚙️ <b>Settings</b>\nTap ➕ / ➖ to change. Changes apply immediately and survive restarts.", rows
+
+    def portfolio_view(self):
+        mine, muted = sorted(self.portfolio()), sorted(self.store.muted())
+        text = (f"⭐ <b>Your portfolio</b> ({len(mine)}): {esc(', '.join(mine)) or 'empty'}\n"
+                f"🔇 Muted: {esc(', '.join(muted)) or 'none'}\n"
+                f"<i>Also watching {len(self.universe)} index stocks and ~{len(self.market_matcher)} companies in the news.</i>")
+        rows = [[(f"❌ {s}", f"rm:{s}") for s in mine[i:i + 3]] for i in range(0, len(mine), 3)]
+        rows.append([("➕ Add stocks", "prompt:add")])
+        rows += [[(f"🔊 Unmute {s}", f"unmute:{s}") for s in muted[i:i + 2]] for i in range(0, len(muted), 2)]
+        return text, rows
+
+    def more_view(self):
+        return "☰ <b>More</b>", [[("🤖 AI status", "cmd:/ai"), ("🔑 Set AI key", "prompt:setkey")],
+                                [("⬆️ Update now", "cmd:/update"), ("❓ What does each alert mean?", "cmd:/help")]]
+
+    HELP = ("<b>What you'll receive</b>\n"
+            "⭐ Anything about your portfolio stocks, with 🤖 AI reasoning\n"
+            "⚡ Breaking: one report the AI judges a large, confident move\n"
+            "🎯 Opportunity: several kinds of evidence agree\n"
+            "📣 Story: 3+ outlets covering a stock\n"
+            "🧭 Sector news that affects your stocks\n"
+            "🌅 9:06 pre-open gaps · ☀️ 8:30 brief · 📋 digests 12:30, 3:45, 8:30pm\n\n"
+            "Use the buttons below the typing box, or the ☰ Menu. "
+            "Paste any headline as a message and the AI tells you what it means for stocks.")
+
     # ================================================================== commands
     def handle_commands(self) -> None:
-        for text in self.tg.commands():
-            parts = text.split()
-            cmd = parts[0].lower().split("@")[0]
-            args = [p.upper().strip(",") for p in parts[1:]]
-            if cmd in ("/add", "/watch") and args:
-                for a in args:
-                    self.store.watch_add(a)
+        for ev in self.tg.commands():
+            if isinstance(ev, str):
+                ev = {"type": "text", "text": ev}
+            try:
+                if ev["type"] == "tap":
+                    self.on_tap(ev)
+                else:
+                    self.on_text(ev["text"])
+            except SystemExit:
+                raise
+            except Exception as e:  # a bad command must never stop the engine
+                log.exception("command failed")
+                self.tg.send(f"⚠️ That didn't work: {esc(str(e)[:200])}")
+
+    def on_tap(self, ev: dict) -> None:
+        data, mid = ev["data"], ev["msg_id"]
+        kind, _, rest = data.partition(":")
+        toast = ""
+        if kind == "cmd":
+            self.on_text(rest)
+        elif kind == "set":
+            name, _, sign = rest.partition(":")
+            _l, step, lo, hi = self.STEPS[name]
+            cur = getattr(config, self.SETTINGS[name][0])
+            new = round(min(hi, max(lo, cur + (step if sign == "+" else -step))), 2)
+            self.set_setting(name, str(new))
+            self.tg.edit(mid, *self.settings_view())
+            toast = f"{self.STEPS[name][0]}: {new:g}"
+        elif kind == "quiet":
+            self.set_setting("quiet", "23-7" if config.QUIET_START == config.QUIET_END else "off")
+            self.tg.edit(mid, *self.settings_view())
+        elif kind in ("rm", "unmute"):
+            if kind == "rm":
+                self.store.watch_remove(rest)
                 self.rebuild_matcher()
-                self.tg.send(f"Added to portfolio: <b>{esc(', '.join(args))}</b>")
-            elif cmd in ("/remove", "/unwatch") and args:
-                for a in args:
-                    self.store.watch_remove(a)
-                self.rebuild_matcher()
-                self.tg.send(f"Removed: <b>{esc(', '.join(args))}</b>")
-            elif cmd == "/mute" and args:
-                for a in args:
-                    self.store.mute(a)
-                self.tg.send(f"Muted: <b>{esc(', '.join(args))}</b>")
-            elif cmd == "/unmute" and args:
-                for a in args:
-                    self.store.mute(a, False)
-                self.tg.send(f"Unmuted: <b>{esc(', '.join(args))}</b>")
-            elif cmd == "/list":
-                self.tg.send(f"⭐ Portfolio: {esc(', '.join(sorted(self.portfolio())) or 'empty, use /add')}\n"
-                             f"🔇 Muted: {esc(', '.join(sorted(self.store.muted())) or 'none')}\n"
-                             f"Scanning {len(self.universe)} index stocks + ~{len(self.market_matcher)} companies in the news")
-            elif cmd == "/top":
-                c = self.top_candidates(time.time() - 24 * 3600, 10)
-                self.tg.send("🎯 <b>Top candidates now</b>\n" + ("\n".join(
-                    f"<b>{esc(s)}</b> {sc:.0f}/100 {ARROW[d['direction']]}" for sc, s, d in c) or "None strong enough."))
-            elif cmd == "/brief":
-                hours = float(args[0]) if args and args[0].replace(".", "").isdigit() else 12
-                self.tg.send_long(self.brief(now() - timedelta(hours=hours), "News brief"))
-            elif cmd == "/digest":
-                self.send_digest("Digest") if self.store.db.execute("SELECT 1 FROM pending LIMIT 1").fetchone() \
-                    else self.tg.send("Nothing held back right now.")
-            elif cmd == "/setkey" and len(parts) >= 2:
-                key = parts[1].strip()
-                self.store.set("ai_key", key)
-                self.ai.key = key
-                prov = self.ai.provider
-                if not prov:
-                    self.tg.send("That doesn't look like a Gemini (AIza… or AQ.…) or Groq (gsk_…) key.")
-                else:
-                    test = self.ai.read("Government raises import duty on steel to 20%", "test", [])
-                    self.tg.send((f"✅ AI reasoning on ({prov}), test read worked."
-                                  if test is not None else
-                                  f"⚠️ Key saved but the test call failed:\n<code>{esc(self.ai.last_error)}</code>")
-                                 + "\nPlease delete your message that contains the key.")
-            elif cmd == "/ask" and len(parts) >= 2:
-                q = text.split(None, 1)[1]
-                if not self.ai.provider:
-                    self.tg.send("AI is off. Send /setkey YOUR_KEY first.")
-                    continue
-                r = self.ai.read(q, "you", sorted(self.portfolio()))
-                if r is None:
-                    self.tg.send(f"⚠️ AI call failed: <code>{esc(self.ai.last_error)}</code>")
-                elif not r["impacts"]:
-                    self.tg.send("🤖 No clear effect on any listed stock" + (" (already priced in)." if r["priced_in"] else "."))
-                else:
-                    out = ["🤖 <b>Likely impact</b>" + (" · already priced in" if r["priced_in"] else "")]
-                    for i in r["impacts"]:
-                        star = "⭐ " if i["symbol"] in self.portfolio() else ""
-                        out.append(f"{'🟢 ↑' if i['direction'] == 'up' else '🔴 ↓'} {star}<b>{esc(i['symbol'])}</b> "
-                                   f"{i['magnitude']} ({i['confidence']:.0%}, {esc(i['order'])})\n   {esc(i['why'])}")
-                    out.append("<i>An AI reading of the headline, not a prediction. Check the price before acting.</i>")
-                    self.tg.send("\n".join(out))
-            elif cmd == "/ai":
-                self.ai.budget_left()
-                self.tg.send(f"🤖 AI reasoning: {self.ai.provider or 'off (send /setkey YOUR_KEY)'}\n"
-                             f"Headlines read today: {self.ai.calls_today}/{self.ai.max_per_day}"
-                             + (f"\nRecent errors: {self.ai.errors}\n<code>{esc(self.ai.last_error)}</code>" if self.ai.errors else ""))
-            elif cmd == "/learn":
-                rows = self.store.outcome_stats()
-                if not rows:
-                    self.tg.send("📊 Nothing measured yet. Each signal's price is checked 1 hour and 1 trading day "
-                                 "later; results appear after the first few days.")
-                else:
-                    out = ["📊 <b>What happened after each kind of signal</b>",
-                           "(hit = moved the predicted way; avg = average move in that direction)"]
-                    for r in rows[:15]:
-                        h1d = f"1d: hit {r['hit1d'] / r['n1d']:.0%}, avg {r['sum1d'] / r['n1d']:+.1f}% (n={r['n1d']})" if r["n1d"] else "1d: pending"
-                        h1h = f"1h: avg {r['sum1h'] / r['n1h']:+.1f}% (n={r['n1h']})" if r["n1h"] else ""
-                        out.append(f"• <b>{esc(r['label'])}</b> [{esc(r['kind'])}] {h1d} {h1h}")
-                    self.tg.send_long(out)
-            elif cmd == "/settings":
-                self.tg.send(self.settings_text())
-            elif cmd == "/set" and len(parts) >= 3:
-                self.tg.send(self.set_setting(parts[1], parts[2]))
-            elif cmd == "/update":
-                self.self_update()
-            elif cmd == "/status":
-                bad = {k: v for k, v in self.failures.items() if v}
-                why = "\n".join(f"• {esc(k)}: {esc(self.last_error.get(k, ''))}" for k in bad)
-                day = now().strftime("%Y-%m-%d")
-                self.tg.send(f"✅ Running · {now().strftime('%d %b %H:%M:%S')} IST\n"
-                             f"Opportunity alerts today: {self.store.count_today('opp', day)}/{config.OPP_MAX_PER_DAY}\n"
-                             f"Failing sources: {esc(bad) if bad else 'none'}" + (f"\n{why}" if why else ""))
             else:
-                self.tg.send("<b>Commands</b>\n/add SYM … — add to portfolio\n/remove SYM\n/list\n"
-                             "/mute SYM — never alert this stock\n/unmute SYM\n"
-                             "/top — strongest candidates right now\n/brief [hours] — news summary\n"
-                             "/digest — send held-back items now\n/settings — see limits\n/set NAME VALUE — change a limit (e.g. /set maxopp 15)\n"
-                             "/update — install the latest version\n/setkey KEY — turn on AI reasoning\n/ask HEADLINE — AI reads any news for you\n/ai — AI status\n"
-                             "/learn — how past signals actually played out\n/status")
+                self.store.mute(rest, False)
+            self.tg.edit(mid, *self.portfolio_view())
+            toast = f"{'Removed' if kind == 'rm' else 'Unmuted'} {rest}"
+        elif kind == "add":
+            self.store.watch_add(rest)
+            self.rebuild_matcher()
+            toast = f"⭐ {rest} added to your portfolio"
+        elif kind == "mute":
+            self.store.mute(rest)
+            toast = f"🔇 {rest} muted"
+        elif kind == "brief":
+            self.tg.send_long(self.brief(now() - timedelta(hours=float(rest)), f"News brief · last {rest}h"))
+        elif kind == "prompt":
+            self.awaiting = rest
+            self.tg.send({"add": "Type the NSE symbols you own, separated by spaces (e.g. <code>TCS HAL IRFC</code>).",
+                          "ask": "Paste any news headline and I'll tell you which stocks it likely moves.",
+                          "setkey": "Paste your Gemini (AQ.… / AIza…) or Groq (gsk_…) key."}.get(rest, "Type it now."))
+        self.tg.answer(ev["id"], toast)
+
+    def on_text(self, text: str) -> None:
+        text = self.PANEL_MAP.get(text, text)
+        if not text.startswith("/"):
+            waiting, self.awaiting = self.awaiting, None
+            if waiting == "add":
+                return self.on_text("/add " + text)
+            if waiting == "setkey":
+                return self.on_text("/setkey " + text)
+            if waiting == "ask" or len(text) >= 15:  # any pasted headline = ask the AI
+                return self.cmd_ask(text)
+            return self.tg.send("Use the buttons below the typing box, or paste a news headline.",
+                                reply_keyboard=self.PANEL)
+        parts = text.split()
+        cmd = parts[0].lower().split("@")[0]
+        args = [p.upper().strip(",") for p in parts[1:]]
+        if cmd in ("/start", "/menu", "/help"):
+            self.tg.send(self.HELP, reply_keyboard=self.PANEL)
+        elif cmd == "/more":
+            self.tg.send(*self.more_view())
+        elif cmd in ("/add", "/watch"):
+            if not args:
+                return self._prompt("add")
+            for a in args:
+                self.store.watch_add(a)
+            self.rebuild_matcher()
+            self.tg.send(*self.portfolio_view())
+        elif cmd in ("/remove", "/unwatch") and args:
+            for a in args:
+                self.store.watch_remove(a)
+            self.rebuild_matcher()
+            self.tg.send(*self.portfolio_view())
+        elif cmd == "/mute" and args:
+            for a in args:
+                self.store.mute(a)
+            self.tg.send(f"🔇 Muted: <b>{esc(', '.join(args))}</b>")
+        elif cmd == "/unmute" and args:
+            for a in args:
+                self.store.mute(a, False)
+            self.tg.send(f"🔊 Unmuted: <b>{esc(', '.join(args))}</b>")
+        elif cmd in ("/portfolio", "/list"):
+            self.tg.send(*self.portfolio_view())
+        elif cmd == "/top":
+            c = self.top_candidates(time.time() - 24 * 3600, 8)
+            if not c:
+                return self.tg.send("🎯 No candidate is strong enough right now.")
+            self.tg.send("🎯 <b>Top candidates now</b> (tap to add or mute)\n" + "\n".join(
+                f"<b>{esc(s)}</b> {sc:.0f}/100 {ARROW[d['direction']]}" for sc, s, d in c),
+                buttons=[[(f"➕ {s}", f"add:{s}"), (f"🔇 {s}", f"mute:{s}")] for _sc, s, _d in c[:6]])
+        elif cmd == "/brief":
+            if args and args[0].replace(".", "").isdigit():
+                return self.tg.send_long(self.brief(now() - timedelta(hours=float(args[0])), "News brief"))
+            self.tg.send("🗞️ News summary for…", buttons=[[("Last 2h", "brief:2"), ("4h", "brief:4"),
+                                                        ("12h", "brief:12"), ("24h", "brief:24")]])
+        elif cmd == "/digest":
+            if self.store.db.execute("SELECT 1 FROM pending LIMIT 1").fetchone():
+                self.send_digest("Digest")
+            else:
+                self.tg.send("📥 Nothing held back right now.")
+        elif cmd == "/setkey":
+            if len(parts) < 2:
+                return self._prompt("setkey")
+            self.cmd_setkey(parts[1].strip())
+        elif cmd == "/ask":
+            if len(parts) < 2:
+                return self._prompt("ask")
+            self.cmd_ask(text.split(None, 1)[1])
+        elif cmd == "/ai":
+            self.ai.budget_left()
+            self.tg.send(f"🤖 AI reasoning: {self.ai.provider or 'off'}\n"
+                         f"Headlines read today: {self.ai.calls_today}/{self.ai.max_per_day}"
+                         + (f"\nRecent errors: {self.ai.errors}\n<code>{esc(self.ai.last_error)}</code>" if self.ai.errors else ""),
+                         buttons=None if self.ai.provider else [[("🔑 Set AI key", "prompt:setkey")]])
+        elif cmd == "/learn":
+            self.cmd_learn()
+        elif cmd == "/settings":
+            self.tg.send(*self.settings_view())
+        elif cmd == "/set" and len(parts) >= 3:
+            self.tg.send(self.set_setting(parts[1], parts[2]))
+        elif cmd == "/update":
+            self.self_update()
+        elif cmd == "/status":
+            bad = {k: v for k, v in self.failures.items() if v}
+            why = "\n".join(f"• {esc(k)}: {esc(self.last_error.get(k, ''))}" for k in bad)
+            day = now().strftime("%Y-%m-%d")
+            self.tg.send(f"✅ Running · {now().strftime('%d %b %H:%M:%S')} IST\n"
+                         f"Today: ⚡ {self.store.count_today('brk', day)}/{config.BREAKING_MAX_PER_DAY} · "
+                         f"🎯 {self.store.count_today('opp', day)}/{config.OPP_MAX_PER_DAY} · "
+                         f"📣 {self.store.count_today('story', day)}/{config.STORY_MAX_PER_DAY}\n"
+                         f"Failing sources: {'none' if not bad else ''}" + (f"\n{why}" if why else ""))
+        else:
+            self.tg.send(self.HELP, reply_keyboard=self.PANEL)
+
+    def _prompt(self, what: str) -> None:
+        self.on_tap({"data": f"prompt:{what}", "msg_id": 0, "id": ""})
+
+    def cmd_setkey(self, key: str) -> None:
+        self.store.set("ai_key", key)
+        self.ai.key = key
+        prov = self.ai.provider
+        if not prov:
+            return self.tg.send("That doesn't look like a Gemini (AIza… or AQ.…) or Groq (gsk_…) key.")
+        test = self.ai.read("Government raises import duty on steel to 20%", "test", [])
+        self.tg.send((f"✅ AI reasoning on ({prov}), test read worked." if test is not None else
+                      f"⚠️ Key saved but the test call failed:\n<code>{esc(self.ai.last_error)}</code>")
+                     + "\nPlease delete your message that contains the key.")
+
+    def cmd_ask(self, q: str) -> None:
+        if not self.ai.provider:
+            return self.tg.send("AI is off.", buttons=[[("🔑 Set AI key", "prompt:setkey")]])
+        r = self.ai.read(q, "you", sorted(self.portfolio()))
+        if r is None:
+            return self.tg.send(f"⚠️ AI call failed: <code>{esc(self.ai.last_error)}</code>")
+        if not r["impacts"]:
+            return self.tg.send("🤖 No clear effect on any listed stock" + (" (already priced in)." if r["priced_in"] else "."))
+        out = ["🤖 <b>Likely impact</b>" + (" · already priced in" if r["priced_in"] else "")]
+        for i in r["impacts"]:
+            star = "⭐ " if i["symbol"] in self.portfolio() else ""
+            out.append(f"{'🟢 ↑' if i['direction'] == 'up' else '🔴 ↓'} {star}<b>{esc(i['symbol'])}</b> "
+                       f"{i['magnitude']} ({i['confidence']:.0%}, {esc(i['order'])})\n   {esc(i['why'])}")
+        out.append("<i>An AI reading of the headline, not a prediction. Check the price before acting.</i>")
+        others = [i["symbol"] for i in r["impacts"] if i["symbol"] not in self.portfolio()][:4]
+        self.tg.send("\n".join(out), buttons=[[(f"➕ {s}", f"add:{s}") for s in others]] if others else None)
+
+    def cmd_learn(self) -> None:
+        rows = self.store.outcome_stats()
+        if not rows:
+            return self.tg.send("📊 Nothing measured yet. Each signal's price is checked 1 hour and 1 trading day "
+                                "later; results appear after the first few days.")
+        out = ["📊 <b>What happened after each kind of signal</b>",
+               "(hit = moved the predicted way; avg = average move in that direction)"]
+        for r in rows[:15]:
+            h1d = (f"1d: hit {r['hit1d'] / r['n1d']:.0%}, avg {r['sum1d'] / r['n1d']:+.1f}% (n={r['n1d']})"
+                   if r["n1d"] else "1d: pending")
+            h1h = f"1h: avg {r['sum1h'] / r['n1h']:+.1f}% (n={r['n1h']})" if r["n1h"] else ""
+            out.append(f"• <b>{esc(r['label'])}</b> [{esc(r['kind'])}] {h1d} {h1h}")
+        self.tg.send_long(out)
 
     # ================================================================== health
     def ok(self, job: str) -> None:
@@ -1075,9 +1216,10 @@ class Radar:
         except Exception as e:
             self.fail("universe", e)
         p = self.portfolio()
+        self.tg.set_menu(self.MENU)
         self.tg.send(f"🛰️ Stock Radar online · portfolio: {len(p)} stocks"
                      + ("" if p else " (send /add SYMBOL for each stock you own)")
-                     + f" · max {config.OPP_MAX_PER_DAY} opportunity alerts/day. Send /help.")
+                     + ". Use the buttons below the typing box.", reply_keyboard=self.PANEL)
         nxt = dict.fromkeys(["filings", "results", "prices", "cmds", "news", "insider", "deals", "outcomes"], 0)
         last_universe = last_prune = now().date()
         retry_universe = 0
