@@ -72,6 +72,7 @@ class Radar:
         self.bse = BSE() if config.USE_BSE else None
         self.universe = set()        # index stocks we scan for prices (not alerted by default)
         self.failures = {}
+        self.last_error = {}
         self.result_tries = {}
         self.warmed_up = set()
         self.names = {}              # symbol -> company name
@@ -94,8 +95,13 @@ class Radar:
 
     def refresh_universe(self) -> None:
         syms = set()
+        err = None
         for idx in config.INDICES:
-            rows, _ = self.nse.index_stocks(idx)
+            try:
+                rows, _ = self.nse.index_stocks(idx)
+            except Exception as e:  # one index failing shouldn't lose the others
+                err = e
+                continue
             for r in rows:
                 syms.add(r["symbol"])
                 self.names[r["symbol"]] = (r.get("meta") or {}).get("companyName", "")
@@ -107,6 +113,8 @@ class Radar:
         except Exception as e:
             self.fail("equity list", e)
         self.rebuild_matcher()
+        if err and not syms:
+            raise err
         log.info("scan list %d, market-wide news matching %d", len(self.universe), len(self.market_matcher))
 
     def rebuild_matcher(self) -> None:
@@ -672,17 +680,22 @@ class Radar:
         if not (config.ROOT / ".git").exists():
             self.tg.send("Updates aren't connected yet. Run the one-time GitHub setup from the README, then /update works.")
             return
-        r = subprocess.run(["git", "-C", root, "pull", "--ff-only"], capture_output=True, text=True, timeout=120)
-        out = (r.stdout + r.stderr).strip()[-600:]
+        def git(*a):
+            return subprocess.run(["git", "-C", root, *a], capture_output=True, text=True, timeout=120)
+        before = git("rev-parse", "HEAD").stdout.strip()
+        r = git("fetch", "origin", "main")
         if r.returncode != 0:
-            self.tg.send(f"⚠️ Update failed:\n<code>{esc(out)}</code>")
+            self.tg.send(f"⚠️ Update failed:\n<code>{esc((r.stdout + r.stderr).strip()[-600:])}</code>")
             return
-        if "Already up to date" in out:
+        after = git("rev-parse", "origin/main").stdout.strip()
+        if after == before:
             self.tg.send("Already on the latest version.")
             return
+        git("reset", "--hard", "origin/main")  # your .env, portfolio and history are untracked, so they're kept
+        log = git("log", "--format=• %s", f"{before}..{after}").stdout.strip()[:800]
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-r", f"{root}/requirements.txt"],
                        capture_output=True, timeout=300)
-        self.tg.send("⬇️ Updated. Restarting in a few seconds…")
+        self.tg.send("⬇️ Updated. Restarting in a few seconds…\n" + esc(log))
         sys.exit(0)  # systemd (or run.sh on Termux) restarts the engine with the new code
 
     # ================================================================== commands
@@ -731,10 +744,11 @@ class Radar:
                 self.self_update()
             elif cmd == "/status":
                 bad = {k: v for k, v in self.failures.items() if v}
+                why = "\n".join(f"• {esc(k)}: {esc(self.last_error.get(k, ''))}" for k in bad)
                 day = now().strftime("%Y-%m-%d")
                 self.tg.send(f"✅ Running · {now().strftime('%d %b %H:%M:%S')} IST\n"
                              f"Opportunity alerts today: {self.store.count_today('opp', day)}/{config.OPP_MAX_PER_DAY}\n"
-                             f"Failing sources: {esc(bad) if bad else 'none'}")
+                             f"Failing sources: {esc(bad) if bad else 'none'}" + (f"\n{why}" if why else ""))
             else:
                 self.tg.send("<b>Commands</b>\n/add SYM … — add to portfolio\n/remove SYM\n/list\n"
                              "/mute SYM — never alert this stock\n/unmute SYM\n"
@@ -751,6 +765,7 @@ class Radar:
     def fail(self, job: str, err: Exception) -> None:
         n = self.failures.get(job, 0) + 1
         self.failures[job] = n
+        self.last_error[job] = f"{type(err).__name__}: {err}"[:160]
         log.warning("%s failed (%d): %s", job, n, err)
         if n == 5 and not job.startswith("news:"):  # one dead news feed isn't worth a ping
             self.tg.send(f"⚠️ <b>{job}</b> has failed 5 times in a row: {esc(str(err)[:200])}\n"
