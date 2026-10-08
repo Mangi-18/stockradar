@@ -878,13 +878,19 @@ class Radar:
                 self.store.set("ai_key", key)
                 self.ai.key = key
                 prov = self.ai.provider
-                self.tg.send(f"✅ AI reasoning on ({prov}). Please delete your message that contains the key."
-                             if prov else "That doesn't look like a Gemini (AIza…) or Groq (gsk_…) key.")
+                if not prov:
+                    self.tg.send("That doesn't look like a Gemini (AIza… or AQ.…) or Groq (gsk_…) key.")
+                else:
+                    test = self.ai.read("Government raises import duty on steel to 20%", "test", [])
+                    self.tg.send((f"✅ AI reasoning on ({prov}), test read worked."
+                                  if test is not None else
+                                  f"⚠️ Key saved but the test call failed:\n<code>{esc(self.ai.last_error)}</code>")
+                                 + "\nPlease delete your message that contains the key.")
             elif cmd == "/ai":
                 self.ai.budget_left()
                 self.tg.send(f"🤖 AI reasoning: {self.ai.provider or 'off (send /setkey YOUR_KEY)'}\n"
                              f"Headlines read today: {self.ai.calls_today}/{self.ai.max_per_day}"
-                             + (f"\nRecent errors: {self.ai.errors}" if self.ai.errors else ""))
+                             + (f"\nRecent errors: {self.ai.errors}\n<code>{esc(self.ai.last_error)}</code>" if self.ai.errors else ""))
             elif cmd == "/learn":
                 rows = self.store.outcome_stats()
                 if not rows:

@@ -6,7 +6,7 @@ more (up) -> companies that buy steel pay more (down). Keyword rules can't do
 that chain of reasoning; a language model can.
 
 Works with a free key from either provider (chosen by the key's prefix):
-  * Google Gemini  (key starts with "AIza")  - aistudio.google.com/apikey
+  * Google Gemini  (key starts with "AIza" or "AQ.")  - aistudio.google.com/apikey
   * Groq           (key starts with "gsk_")  - console.groq.com/keys
 """
 import json
@@ -50,10 +50,11 @@ class AIReader:
         self.day = ""
         self.calls_today = 0
         self.errors = 0
+        self.last_error = ""
 
     @property
     def provider(self) -> str:
-        if self.key.startswith("AIza"):
+        if self.key.startswith(("AIza", "AQ.")):  # AI Studio now issues "AQ." auth keys
             return "gemini"
         if self.key.startswith("gsk_"):
             return "groq"
@@ -83,16 +84,19 @@ class AIReader:
             return data
         except Exception as e:
             self.errors += 1
+            self.last_error = str(e)[:300]
             log.warning("ai read failed: %s", e)
             return None
 
     def _gemini(self, prompt: str) -> str:
         url = ("https://generativelanguage.googleapis.com/v1beta/models/"
                f"{self.model or 'gemini-2.5-flash-lite'}:generateContent")
-        r = requests.post(url, params={"key": self.key}, timeout=20, json={
+        # The key goes in a header: new "AQ." keys are rejected when sent as ?key=
+        r = requests.post(url, headers={"x-goog-api-key": self.key}, timeout=20, json={
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"}})
-        r.raise_for_status()
+        if r.status_code >= 400:
+            raise RuntimeError(f"Gemini {r.status_code}: {r.text[:200]}")
         return r.json()["candidates"][0]["content"]["parts"][0]["text"]
 
     def _groq(self, prompt: str) -> str:
@@ -101,7 +105,8 @@ class AIReader:
                               "model": self.model or "llama-3.3-70b-versatile", "temperature": 0.2,
                               "response_format": {"type": "json_object"},
                               "messages": [{"role": "user", "content": prompt}]})
-        r.raise_for_status()
+        if r.status_code >= 400:
+            raise RuntimeError(f"Groq {r.status_code}: {r.text[:200]}")
         return r.json()["choices"][0]["message"]["content"]
 
     model = ""
