@@ -140,6 +140,16 @@ more to run.
   ☰ More → 👥 Users to see who's using it and 🚫 remove anyone
 - Only the owner can ⬆️ update and 🔑 set the AI key; the AI's daily budget is shared
 
+## 📡 Telegram channels
+
+The owner can add **public** Telegram channels (☰ More → 📡 Channels → ➕ Add
+channel, then send `@channelname` or a `t.me/...` link). The engine reads each
+channel's public web preview every minute. A post that mentions someone's
+stock, or that the AI judges will affect it, is forwarded to the people who
+hold it, with the AI's reading. Channel posts never trigger market-wide ⚡ / 🎯
+/ 📣 alerts, because tip channels can be used to pump stocks. Private channels
+and groups can't be read this way.
+
 ## Using it: buttons, no typing
 
 - **Button panel** below the typing box: 🎯 Top · 🗞️ Brief · ⭐ Portfolio · 🤖 Ask AI · ⚙️ Settings · 📥 Digest · 📊 Learn · 🩺 Status · ☰ More

@@ -19,6 +19,7 @@ from datetime import datetime, timedelta, timezone
 from . import config
 from .ai import AIReader
 from .bse import BSE
+from .channels import Channels, clean_name
 from .classify import HIGH, MEDIUM, classify
 from .news import (DEFAULT_FEEDS, NewsFeeds, analyse_headline, build_market_matcher,
                    build_matcher, split_source)
@@ -168,6 +169,8 @@ class Radar:
         self.momentum = Momentum(config.MOMENTUM_WINDOW_MIN * 60, config.MOMENTUM_MOVE,
                                  config.MOMENTUM_VOL_MULT)
         self.news = NewsFeeds(config.NEWS_FEEDS or DEFAULT_FEEDS)
+        self.channels = Channels()
+        self._ai_chan_cycle = 0
         if self.store.get("initialized"):
             self.warmed_up = {"nse", "bse", "results", "insider", "deals"}
         owner = str(config.TELEGRAM_CHAT_ID or "")
@@ -814,6 +817,81 @@ class Radar:
             lines.append(f"<i>Story alert {n} of {cap} today.</i>")
             u.send("\n".join(lines), buttons=self.stock_buttons(sym))
 
+    # ================================================================== Telegram channels
+    def channel_list(self) -> list:
+        return [c for c in (self.store.get("channels") or "").split(",") if c]
+
+    def poll_channels(self) -> None:
+        """Public Telegram channels the owner added: posts mentioning someone's portfolio
+        (directly, or per the AI's reading) are forwarded to those people."""
+        self._ai_chan_cycle = 0
+        for name in self.channel_list():
+            try:
+                posts = self.channels.fetch(name)
+                self.ok("tg:" + name)
+            except Exception as e:
+                self.fail("tg:" + name, e)
+                continue
+            first = not self.store.get(f"chan_init:{name}")
+            for p in posts:
+                if self.store.first_time("tgpost:" + p["id"]) and not first:
+                    self.handle_channel_post(name, p["text"], f"https://t.me/{p['id']}")
+            self.store.set(f"chan_init:{name}", "1")
+
+    def handle_channel_post(self, name: str, text: str, link: str) -> None:
+        headline = text[:300]
+        a = analyse_headline(headline, self.matcher, self.market_matcher)
+        held = self.portfolio()
+        syms = a["stocks"] + a["others"]
+        mine = [s for s in syms if s in held]
+        ai_by = {}
+        # Channel posts can be chatty; only ask the AI when they could matter to someone's portfolio
+        if self.ai.provider and held and self._ai_chan_cycle < 4 and (mine or self.POLICY.search(headline)):
+            self._ai_chan_cycle += 1
+            r = self.ai.read(headline, f"Telegram channel @{name}", sorted(held))
+            if r and r["relevant"] and not r["priced_in"]:
+                ai_by = {i["symbol"]: i for i in r["impacts"] if i["confidence"] >= 0.5 and i["symbol"] in held}
+        c = classify(headline)
+        t = a["tone"] if a["tone"] != "?" else c["tone"]
+        for s in syms:  # kept for briefs/context, but channel posts never trigger market-wide alerts
+            self.store.log_event(s, "tgnews", headline, t, c["impact"], f"@{name}", link)
+        for s in mine + [s for s in ai_by if s not in mine]:
+            i = ai_by.get(s)
+            tone_s = ("+" if i["direction"] == "up" else "-") if i else t
+            ai_line = (f"\n🤖 {'↑' if i['direction'] == 'up' else '↓'} {i['magnitude']} impact likely "
+                       f"({i['confidence']:.0%}): {esc(i['why'])}") if i else ""
+            urgent = bool(i and i["magnitude"] in ("medium", "large") and i["confidence"] >= 0.7)
+            self.notify(s, f"📡 {TONE[tone_s]} <b>⭐ {esc(s)}</b> · from @{esc(name)}\n{esc(text[:500])}{ai_line}\n"
+                           f'<a href="{esc(link)}">Open post</a>', urgent=urgent)
+
+    def channels_view(self):
+        chans = self.channel_list()
+        lines = ["📡 <b>Telegram channels I read</b>",
+                 "Posts that mention your stocks (or affect them, per the AI) are sent to you."]
+        lines += [f"• @{esc(c)}" + (" ⚠️ not reachable" if self.failures.get("tg:" + c) else "") for c in chans] or ["• none yet"]
+        rows = [[(f"❌ @{c}", f"rmch:{c}")] for c in chans] + [[("➕ Add channel", "prompt:channel")]]
+        return "\n".join(lines), rows
+
+    def add_channel(self, u, raw: str) -> None:
+        name = clean_name(raw)
+        if not name:
+            return u.send("That doesn't look like a channel. Send its username, like <code>@channelname</code> "
+                          "or a <code>t.me/channelname</code> link.")
+        try:
+            posts = self.channels.fetch(name)
+        except Exception as e:
+            return u.send(f"⚠️ Couldn't read @{esc(name)}: {esc(str(e)[:150])}\n"
+                          "Only <b>public</b> channels can be read this way.")
+        chans = self.channel_list()
+        if name not in chans:
+            chans.append(name)
+            self.store.set("channels", ",".join(chans))
+        for p in posts:  # don't re-send old posts
+            self.store.first_time("tgpost:" + p["id"])
+        self.store.set(f"chan_init:{name}", "1")
+        u.send(f"✅ Now reading @{esc(name)} ({len(posts)} recent posts found). New posts about your "
+               "family's stocks will be forwarded.", buttons=self.channels_view()[1])
+
     # ================================================================== learning
     def poll_outcomes(self) -> None:
         """Record the price when a signal fired, 1 hour later and 1 trading day later."""
@@ -1041,7 +1119,7 @@ class Radar:
         "gap": ("🌅 Pre-open gap %", 0.5, 0.5, 10),
         "outlets": ("📣 Outlets for story", 1, 1, 6), "maxstory": ("📣 Stories/day", 1, 0, 50),
         "breakconf": ("⚡ Breaking confidence", 0.05, 0.5, 0.95), "maxbreak": ("⚡ Breaking/day", 1, 0, 50)}
-    OWNER_ONLY = {"/update", "/setkey", "/users"}
+    OWNER_ONLY = {"/update", "/setkey", "/users", "/channels", "/addchannel"}
 
     def stock_buttons(self, sym: str):
         return [[(f"➕ Add {sym} to portfolio", f"add:{sym}"), (f"🔇 Mute {sym}", f"mute:{sym}")]]
@@ -1068,7 +1146,8 @@ class Radar:
     def more_view(self, u: User):
         rows = [[("❓ What does each alert mean?", "cmd:/help")]]
         if u.is_owner:
-            rows = [[("👥 Users", "cmd:/users"), ("🤖 AI status", "cmd:/ai")],
+            rows = [[("👥 Users", "cmd:/users"), ("📡 Channels", "cmd:/channels")],
+                    [("🤖 AI status", "cmd:/ai")],
                     [("🔑 Set AI key", "prompt:setkey"), ("⬆️ Update now", "cmd:/update")]] + rows
         return "☰ <b>More</b>", rows
 
@@ -1161,12 +1240,18 @@ class Radar:
         elif kind == "brief":
             u.send_long(self.brief(now() - timedelta(hours=float(rest)), f"News brief · last {rest}h", user=u))
         elif kind == "prompt":
-            if rest == "setkey" and not u.is_owner:
+            if rest in ("setkey", "channel") and not u.is_owner:
                 return self.tg.answer(ev["id"], "Only the owner can do that.")
             self.awaiting[u.chat] = rest
             u.send({"add": "Type the NSE symbols you own, separated by spaces (e.g. <code>TCS HAL IRFC</code>).",
                     "ask": "Paste any news headline and I'll tell you which stocks it likely moves.",
-                    "setkey": "Paste your Gemini (AQ.… / AIza…) or Groq (gsk_…) key."}.get(rest, "Type it now."))
+                    "setkey": "Paste your Gemini (AQ.… / AIza…) or Groq (gsk_…) key.",
+                    "channel": "Send the public channel's username (e.g. <code>@channelname</code>) or its t.me link."
+                    }.get(rest, "Type it now."))
+        elif kind == "rmch" and u.is_owner:
+            self.store.set("channels", ",".join(c for c in self.channel_list() if c != rest))
+            self.tg.edit(mid, *self.channels_view(), chat=u.chat)
+            toast = f"Stopped reading @{rest}"
         elif kind in ("kick", "allow") and u.is_owner:
             self.store.user_set_status(rest, "removed" if kind == "kick" else "active")
             if mid:
@@ -1182,6 +1267,8 @@ class Radar:
                 return self.on_text(u, "/add " + text)
             if waiting == "setkey":
                 return self.on_text(u, "/setkey " + text)
+            if waiting == "channel":
+                return self.on_text(u, "/addchannel " + text)
             if waiting == "ask" or len(text) >= 15:  # any pasted headline = ask the AI
                 return self.cmd_ask(u, text)
             return u.send("Use the buttons below the typing box, or paste a news headline.", reply_keyboard=self.PANEL)
@@ -1196,6 +1283,12 @@ class Radar:
             u.send(*self.more_view(u))
         elif cmd == "/users":
             u.send(*self.users_view())
+        elif cmd == "/channels":
+            u.send(*self.channels_view())
+        elif cmd == "/addchannel":
+            if len(parts) < 2:
+                return self._prompt(u, "channel")
+            self.add_channel(u, parts[1])
         elif cmd in ("/add", "/watch"):
             if not args:
                 return self._prompt(u, "add")
@@ -1345,7 +1438,7 @@ class Radar:
         n = len(self.store.users("active"))
         self.owner.send(f"🛰️ Stock Radar online · {n} {'person' if n == 1 else 'people'} using it · "
                         f"your portfolio: {len(self.owner.portfolio())} stocks.", reply_keyboard=self.PANEL)
-        nxt = dict.fromkeys(["filings", "results", "prices", "cmds", "news", "insider", "deals", "outcomes"], 0)
+        nxt = dict.fromkeys(["filings", "results", "prices", "cmds", "news", "insider", "deals", "outcomes", "channels"], 0)
         last_universe = last_prune = now().date()
         retry_universe = 0
         while True:
@@ -1373,6 +1466,8 @@ class Radar:
                 self.poll_prices()
             if market_open(t) and due("outcomes", 300):
                 self.poll_outcomes()
+            if self.channel_list() and due("channels", 60):
+                self.poll_channels()
             if due("cmds", config.TELEGRAM_POLL):
                 self.handle_commands()
 

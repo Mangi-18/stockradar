@@ -559,6 +559,62 @@ def test_old_single_user_data_moves_to_owner():
     assert "LICI" in r.owner.portfolio() and r.owner.cfg("maxopp") == 12
 
 
+# ---------------------------------------------------------------- Telegram channels
+from radar.channels import clean_name, parse_channel  # noqa: E402
+
+PAGE = """<div class="tgme_channel_info">x</div>
+<div class="tgme_widget_message_wrap"><div class="tgme_widget_message js-widget_message" data-post="mktnews/101">
+<div class="tgme_widget_message_text js-message_text" dir="auto"><b>HAL</b> bags Rs 5,000 crore order<br/>from MoD &amp; more</div>
+<time datetime="2026-10-08T10:00:00+00:00">10:00</time></div></div>
+<div class="tgme_widget_message js-widget_message" data-post="mktnews/102">
+<div class="tgme_widget_message_photo_wrap"></div></div>
+<div class="tgme_widget_message js-widget_message" data-post="mktnews/103">
+<div class="tgme_widget_message_text js-message_text" dir="auto">Nifty opens flat</div></div>"""
+
+
+def test_parse_public_channel_page():
+    posts = parse_channel(PAGE)
+    assert [p["id"] for p in posts] == ["mktnews/101", "mktnews/103"]
+    assert posts[0]["text"] == "HAL bags Rs 5,000 crore order from MoD & more"
+    assert clean_name("https://t.me/s/ETMarkets") == "ETMarkets" and clean_name("@abc_news") == "abc_news"
+    assert clean_name("hello world") == ""
+
+
+def test_channel_posts_go_to_holders_only():
+    r = make_radar(["TCS"])
+    r.store.user_add("2", "Mom"); r.store.watch_add("HAL", "2")
+    r.names.update({"HAL": "Hindustan Aeronautics"}); r.rebuild_matcher()
+    r.store.set("channels", "mktnews")
+    class C:
+        def fetch(self, name):
+            return parse_channel(PAGE)
+    r.channels = C()
+    r.poll_channels()                 # first read of a channel: remember, don't flood
+    assert not r.sent
+    for k in ("tgpost:mktnews/101", "tgpost:mktnews/103"):
+        r.store.db.execute("DELETE FROM seen WHERE key = ?", (k,))
+    r.poll_channels()
+    hal = [c for m, c in zip(r.sent, r.sent_to) if "⭐ HAL" in m and "@mktnews" in m]
+    assert hal == ["2"], (r.sent, r.sent_to)
+    assert not any("BREAKING" in m or "Story" in m or "Opportunity" in m for m in r.sent)
+
+
+def test_add_channel_owner_only():
+    r = make_radar()
+    class C:
+        def fetch(self, name):
+            return parse_channel(PAGE)
+    r.channels = C()
+    r.store.user_add("2", "Cousin")
+    r.tg.commands = lambda: [{"type": "text", "text": "/addchannel @mktnews", "chat": "2", "name": "Cousin"}]
+    r.handle_commands()
+    assert r.channel_list() == [] and "owner" in r.sent[-1]
+    r.tg.commands = lambda: [{"type": "tap", "data": "prompt:channel", "id": "1", "msg_id": 0, "chat": "1"},
+                             {"type": "text", "text": "t.me/mktnews", "chat": "1"}]
+    r.handle_commands()
+    assert r.channel_list() == ["mktnews"] and "Now reading @mktnews" in r.sent[-1]
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
