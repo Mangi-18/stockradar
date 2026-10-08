@@ -1,0 +1,132 @@
+# Stock Radar — real-time NSE/BSE alerts on Telegram
+
+Watches exchange filings, insider trades, big deals, pre-open orders and live
+news, and messages you on Telegram within seconds, so you can act before most
+investors have even seen the news.
+
+## What you get, ordered by how EARLY it is
+
+Nobody legally knows news before it's public. The edge is acting in the
+first seconds and minutes after it goes public, before most investors notice.
+
+| When | Alert | Why it's early |
+|---|---|---|
+| Days ahead | **Catalyst calendar** (8:30am) and instant alerts when a board meeting for **bonus / split / buyback / fund raising** is announced | The event is known in advance; stocks often run up between announcement and record date |
+| Hours to days ahead | **Promoter buying** (SEBI insider filings, every 2 min) | Promoters know their business best; buying with their own money is one of the most reliable signals |
+| Hours ahead | **Bulk / block deals** (big funds taking stakes, every 5 min) | Large investors positioning |
+| 9 min before open | **Pre-open gaps** at ~9:06am with the filing/news behind each gap | You see the opening price before trading starts |
+| Seconds after release | **Exchange filings** (NSE + BSE every 15 s), **results with numbers + score** (every 30 s) | The exchange is the first public source; news sites follow minutes later |
+| Seconds after release, **24x7** | **Live news every 30 s, day and night** from 15 feeds (ET, Moneycontrol, Business Standard, Mint, Financial Express, BusinessLine, NDTV Profit, govt press releases, and Google News, which aggregates hundreds of Indian outlets). Headlines are matched to **every NSE company** (~2,000). Your portfolio stocks alert; everything else goes through the opportunity score below | News is the biggest driver of moves; it arrives at any hour |
+| Seconds after release | **Sector / policy news** (defence, railways, crude, RBI, steel duty, USFDA, IT/visa, power, gold, telecom, autos, rural, infra) with the most exposed stocks | Policy news moves whole sectors before any company files |
+| Before the open | **Pre-market brief at 8:30am**: everything since yesterday's 3:30pm close (overnight and weekend news), ranked: global cues, your stocks, big news on other stocks, sectors. Then the catalyst calendar. Send `/brief` any time for the last 12 h (`/brief 4` = last 4 h) | You start the day knowing what happened while you slept |
+| Start of a move | **Early momentum** (every 30 s): +/-1.5% within 5 min; 🔥 when volume is also 3x its normal pace | Catches a move at +2%, not +8% |
+| After (confirmation) | 5% / 10% crossings, 52-week highs, each with the likely reason | For context, not for entry |
+
+News headlines that only report a move that already happened ("shares jump 8%")
+are tagged ⏱️ *already moving*, so you don't chase them blindly.
+
+**Results score (−4 to +4)** comes from `radar/results.py`: profit growth YoY,
+revenue growth YoY, net-margin change, and loss↔profit swings. Every point is
+explained in the alert. It compares with last year, not analyst estimates, and
+it does not predict the price.
+
+## How it avoids spamming you
+
+| Who | What reaches you |
+|---|---|
+| **Your portfolio** (`PORTFOLIO` in `.env`, or `/add` in Telegram) | Every relevant filing, news item, results, promoter trade, deal, price burst and 5%/10% move. Urgent items (HIGH-impact news, results, big moves) arrive instantly; routine ones are limited to one ping per stock per hour, the rest wait for the digest |
+| **Everything else** (~2,000 stocks) | Watched silently. A stock pings you only as a 🎯 **Opportunity**, when independent signals agree: evidence score ≥ 70/100, at most **5 per day**, once per stock per day |
+| Sector / policy news | Only pings if it affects a stock you own; otherwise it goes into the digest |
+| Quiet hours (11pm–7am) | Only urgent portfolio alerts; everything else is in the 8:30am brief |
+
+**Evidence score (0–100)**, from `radar/scoring.py`. One headline is weak
+evidence; agreement between independent signals is strong:
+
+- strongest single item: exchange filing or results far from last year +40, promoter buying +35, high-impact news +30, bulk/block deal +25
+- +10 per extra outlet covering it (max +30)
+- +12 per extra *kind* of signal (filing + news + promoter buy + deal + price burst; max +24)
+- +15 if the price is moving on heavy volume
+- −25 if the price has already moved a lot, −15 for mixed signals, −10 if the direction is unclear
+
+Example: an order-win filing reported by 3 outlets scores 72 and pings you. The
+same filing with only 1 outlet scores 40 and goes to the digest. It ranks the
+strength of evidence; it is not a probability.
+
+Typical day: a handful of portfolio alerts, up to 5 opportunities, 3 digests
+(12:30, 3:45pm, 8:30pm), the 8:30am brief and the 9:06 pre-open. All limits are
+in `.env`.
+
+## Setup (about 30 minutes, free)
+
+### 1. Telegram bot
+1. In Telegram, open **@BotFather** → `/newbot` → copy the token.
+2. Send any message to your new bot.
+3. Open `https://api.telegram.org/bot<TOKEN>/getUpdates` in a browser and copy
+   `"chat":{"id": ...}` — that's your chat id.
+
+### 2. Free cloud VM (always on)
+Oracle Cloud "Always Free" is the most generous. Create an Ubuntu VM in the
+**Mumbai or Hyderabad** region (Indian IPs are less likely to be blocked by NSE).
+Google Cloud's free e2-micro also works.
+
+### 3. Install
+```bash
+sudo apt update && sudo apt install -y python3-venv git
+cd ~ && mkdir stockradar   # then upload this folder's files into it (scp, or git)
+cd ~/stockradar
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+cp .env.example .env && nano .env      # paste token + chat id
+.venv/bin/python -m radar.check        # every line should say OK
+```
+
+### 4. Keep it running 24/7
+```bash
+sudo cp deploy/stockradar.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now stockradar
+journalctl -u stockradar -f            # live logs
+```
+You'll get "🛰️ Stock Radar online" in Telegram.
+
+## Telegram commands
+- `/add TCS HAL IRFC` — add stocks to your portfolio
+- `/remove IRFC`
+- `/list` — your portfolio and muted stocks
+- `/mute XYZ` / `/unmute XYZ` — never hear about a stock
+- `/top` — strongest candidates right now, with scores
+- `/brief` — news summary of the last 12 hours (`/brief 4` for the last 4)
+- `/digest` — send the held-back items now
+- `/status` — is it alive, opportunity alerts used today, failing sources
+- `/settings` — see all limits; `/set maxopp 15`, `/set score 60`, `/set cooldown 0`, `/set quiet off` change them instantly (no server login needed)
+- `/update` — install the latest version from GitHub and restart (after the one-time setup below)
+
+## One-time setup for one-tap updates
+
+1. The code lives in a GitHub repo (e.g. `yourname/stockradar`).
+2. On the server, once:
+   ```
+   cd ~/stockradar
+   git init -b main && git remote add origin https://github.com/YOURNAME/stockradar.git
+   git fetch origin && git reset --hard origin/main
+   sudo systemctl restart stockradar
+   ```
+   Your `.env` settings, portfolio and history are kept (they're not in the repo).
+3. From then on, send `/update` in Telegram whenever there's a new version.
+
+## Things to know
+- **NSE blocks some cloud IPs.** If `radar.check` shows NSE `FAIL ... 403`, try
+  another region or provider. BSE usually still works, so filings keep coming.
+  If a source fails 5 times in a row you get a ⚠️ alert, so you're never
+  silently blind.
+- These are NSE's website endpoints, not an official paid feed. They can change
+  without notice. If something breaks, the fix is usually a field name in
+  `nse.py`.
+- First run on an empty database stays quiet about old filings. After a
+  restart it alerts anything filed while it was down.
+- Want tick-level prices later? Add Zerodha Kite Connect's WebSocket; for
+  swing/long-term trading, filings are the bigger edge.
+- Nothing here is investment advice. A filing alert means "look now",
+  not "buy now".
+
+## Tests
+`python tests/test_radar.py` — offline tests for classification, XBRL parsing
+and scoring, alert de-duplication and price-level logic.

@@ -1,0 +1,14 @@
+[Unit]
+Description=Stock Radar (NSE/BSE filings, results and price alerts)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/stockradar
+ExecStart=/home/ubuntu/stockradar/.venv/bin/python -m radar.main
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
