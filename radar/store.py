@@ -165,3 +165,14 @@ class Store:
             if a["n1d"] >= min_n or a["n1h"] >= min_n:
                 out.append({"kind": kind, "label": label, **a})
         return sorted(out, key=lambda x: -(x["n1d"] + x["n1h"]))
+
+    def news_by_source(self, symbol: str, hours: float) -> list:
+        """Latest headline per outlet for a stock in the last `hours` (newest first)."""
+        cutoff = time.time() - hours * 3600
+        rows = self.db.execute(
+            "SELECT source, headline, MAX(ts) FROM events WHERE symbol = ? AND kind = 'news' AND ts > ? "
+            "GROUP BY source ORDER BY MAX(ts) DESC", (symbol, cutoff)).fetchall()
+        return [(src, h) for src, h, _ in rows]
+
+    def has_seen(self, key: str) -> bool:
+        return self.db.execute("SELECT 1 FROM seen WHERE key = ?", (key,)).fetchone() is not None

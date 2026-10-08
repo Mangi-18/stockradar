@@ -178,7 +178,8 @@ class Radar:
         day = now().strftime("%Y-%m-%d")
         if s["score"] >= config.OPP_MIN_SCORE and not quiet_hours(now()):
             used = self.store.count_today("opp", day)
-            if used < config.OPP_MAX_PER_DAY and self.store.first_time(f"opp:{day}:{sym}"):
+            if (used < config.OPP_MAX_PER_DAY and not self.store.has_seen(f"story:{day}:{sym}:sent")
+                    and self.store.first_time(f"opp:{day}:{sym}")):
                 self.tg.send(self.format_opportunity(sym, s, used + 1))
                 return
         if s["score"] >= config.OPP_DIGEST_SCORE and self.store.first_time(f"oppq:{day}:{sym}"):
@@ -522,7 +523,9 @@ class Radar:
         if self._ai_cycle >= 6 and not mine:
             return False
         self._ai_cycle += 1
-        return bool(mine or a["themes"] or (a["global"] and a["dramatic"])
+        spreading = any(self.store.news_sources(s, config.STORY_WINDOW_H) >= config.STORY_MIN_OUTLETS - 1
+                        for s in syms)  # this headline may be the one that makes it a story
+        return bool(mine or spreading or a["themes"] or (a["global"] and a["dramatic"])
                     or (syms and c["impact"] == HIGH) or self.POLICY.search(a.get("_title", "")))
 
     def handle_headline(self, title: str, src: str, link: str, _unused=None) -> None:
@@ -586,6 +589,9 @@ class Radar:
         for s in set(syms) | set(ai_by):
             if s not in mine_set:
                 self.consider(s)
+        for s in syms:
+            if s not in mine_set:
+                self.story_check(s, title, src, ai_by.get(s), a["already_moved"])
 
         # --- sector / policy news
         if a["themes"] and config.NEWS_THEMES and not a["already_moved"]:
@@ -605,6 +611,48 @@ class Radar:
                 self.store.queue("", msg, 30)
         elif a["global"] and a["dramatic"] and self.store.first_time(f"global:{int(time.time() // 3600)}"):
             self.tg.send(f"🌍 <b>Global cue</b>\n{esc(title)}\n{stamp}")
+
+    def story_check(self, sym: str, title: str, src: str, ai_i, moved: bool) -> None:
+        """📣 A stock outside your portfolio is being covered by several outlets at once.
+        Send the headlines plus the AI's reading of what it means for the price."""
+        day = now().strftime("%Y-%m-%d")
+        key = f"story:{day}:{sym}"
+        if sym in self.store.muted() or self.store.get(key) or quiet_hours(now()) \
+                or self.store.has_seen(f"opp:{day}:{sym}"):  # already sent as a 🎯 opportunity today
+            return
+        outlets = self.store.news_by_source(sym, config.STORY_WINDOW_H)
+        if len(outlets) < config.STORY_MIN_OUTLETS:
+            return
+        if self.store.count_today("story", day) >= config.STORY_MAX_PER_DAY:
+            self.store.set(key, "capped")
+            self.store.queue(sym, f"📣 <b>{esc(sym)}</b> covered by {len(outlets)} outlets: {esc(title[:120])}", 60)
+            return
+        if ai_i is None and self.ai.provider:  # the headline that tipped it over may not have had an AI read
+            r = self.ai.read(title, src, sorted(self.portfolio()))
+            if r and r["priced_in"]:
+                moved = True
+            ai_i = next((i for i in (r or {}).get("impacts", []) if i["symbol"] == sym), None)
+        dc = self.day_change.get(sym)
+        if ai_i and dc is not None and abs(dc) >= 7 and (dc > 0) == (ai_i["direction"] == "up"):
+            moved = True
+        if self.ai.provider and ai_i is None:
+            self.store.set(key, "no-impact")  # AI sees no price effect for this stock: stay quiet
+            return
+        self.store.set(key, "sent")
+        self.store.first_time(f"story:{day}:{sym}:sent")
+        n = self.store.count_today("story", day)
+        lines = [f"📣 <b>Story spreading · {esc(sym)}</b> · {len(outlets)} outlets in {config.STORY_WINDOW_H:g}h"]
+        if ai_i:
+            up = ai_i["direction"] == "up"
+            lines.append(f"🤖 {'🟢 ↑' if up else '🔴 ↓'} {ai_i['magnitude']} impact likely "
+                         f"({ai_i['confidence']:.0%}, {esc(ai_i['order'])}): {esc(ai_i['why'])}")
+        if moved:
+            lines.append("⏱️ The price has already moved a lot on this; you may be late.")
+        elif dc is not None:
+            lines.append(f"Price today so far: {dc:+.1f}%")
+        lines += [f"• {esc(h[:140])} <i>({esc(o)})</i>" for o, h in outlets[:4]]
+        lines.append(f"<i>Story alert {n} of {config.STORY_MAX_PER_DAY} today · /add {esc(sym)} to track · /mute {esc(sym)} to silence</i>")
+        self.tg.send("\n".join(lines))
 
     # ================================================================== learning
     def poll_outcomes(self) -> None:
@@ -770,6 +818,8 @@ class Radar:
         "cooldown": ("STOCK_COOLDOWN_MIN", float, "minutes between routine pings per portfolio stock (0 = off)"),
         "burst": ("MOMENTUM_MOVE", float, "% move in 5 min that counts as early momentum"),
         "gap": ("PREOPEN_MIN_GAP", float, "% pre-open gap for your stocks"),
+        "outlets": ("STORY_MIN_OUTLETS", int, "outlets covering a stock before a 📣 story alert"),
+        "maxstory": ("STORY_MAX_PER_DAY", int, "max 📣 story alerts per day"),
     }
 
     def apply_saved_settings(self) -> None:

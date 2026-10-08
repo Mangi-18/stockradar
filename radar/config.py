@@ -81,3 +81,8 @@ DIGEST_TIMES = [t.strip() for t in os.environ.get("DIGEST_TIMES", "12:30,15:45,2
 AI_KEY = os.environ.get("AI_KEY", "")
 AI_MODEL = os.environ.get("AI_MODEL", "")          # empty = provider default
 AI_MAX_PER_DAY = int(_float("AI_MAX_PER_DAY", 400))  # stays inside free-tier daily limits
+
+# --- Story alerts: a stock's news spreading across outlets, with the AI's read ---
+STORY_MIN_OUTLETS = int(_float("STORY_MIN_OUTLETS", 3))   # different outlets within STORY_WINDOW_H
+STORY_WINDOW_H = _float("STORY_WINDOW_H", 3)
+STORY_MAX_PER_DAY = int(_float("STORY_MAX_PER_DAY", 10))

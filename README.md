@@ -42,6 +42,15 @@ portfolio alerts then show a 🤖 line with that reasoning, and the result feeds
 the evidence score. Invented symbols are discarded; only real NSE symbols are
 kept. `/ai` shows how many headlines it read today.
 
+## 📣 Story alerts (any stock, not just yours)
+
+When 3 or more different outlets cover the same stock within 3 hours, the story
+is spreading. You get one 📣 alert for that stock that day, with the AI's read
+(which way, how big, why), the headlines and their sources, and today's price
+change so far, flagged ⏱️ if the price has already moved a lot. If the AI sees
+no price effect (a CEO interview, generic commentary), it stays quiet. Change
+the trigger with `/set outlets 2` and the daily cap with `/set maxstory 15`.
+
 ## Learning from what actually happened
 
 Every directional signal (filing, results, AI read, promoter buy, block deal,

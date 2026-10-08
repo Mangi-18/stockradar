@@ -371,6 +371,35 @@ def test_ask_command():
     assert "ONGC" in r.sent[-1] and "↓" in r.sent[-1] and "⭐" in r.sent[-1]
 
 
+def test_story_alert_after_three_outlets_with_ai():
+    r = make_radar(["TCS"])
+    r.market_matcher = build_market_matcher({"GPIL": "Godawari Power and Ispat"})
+    r.names["GPIL"] = "Godawari Power and Ispat"
+    r.ai.key = "AQ.test"
+    r.ai.read = lambda h, src, port: {"relevant": True, "priced_in": False, "impacts": [
+        {"symbol": "GPIL", "direction": "up", "magnitude": "medium", "confidence": 0.75,
+         "order": "direct", "why": "new capacity lifts earnings"}]}
+    r.handle_headline("Godawari Power and Ispat to expand pellet capacity", "ET", "")
+    r.handle_headline("Godawari Power and Ispat plans expansion", "Mint", "")
+    assert not any("Story" in m for m in r.sent)
+    r.handle_headline("Godawari Power and Ispat capex plan explained", "Moneycontrol", "")
+    story = [m for m in r.sent if "Story spreading" in m]
+    assert len(story) == 1 and "GPIL" in story[0] and "↑" in story[0] and "3 outlets" in story[0], r.sent
+    r.handle_headline("Godawari Power and Ispat in focus", "BS", "")
+    assert len([m for m in r.sent if "Story spreading" in m]) == 1   # once per stock per day
+
+
+def test_story_alert_silent_when_ai_sees_no_impact():
+    r = make_radar()
+    r.market_matcher = build_market_matcher({"GPIL": "Godawari Power and Ispat"})
+    r.names["GPIL"] = "Godawari Power and Ispat"
+    r.ai.key = "AQ.test"
+    r.ai.read = lambda h, src, port: {"relevant": False, "priced_in": False, "impacts": []}
+    for src in ("ET", "Mint", "Moneycontrol"):
+        r.handle_headline("Godawari Power and Ispat CEO speaks at conference", src, "")
+    assert not any("Story" in m for m in r.sent)
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
