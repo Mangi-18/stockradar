@@ -89,12 +89,19 @@ class AIReader:
             return None
 
     def _gemini(self, prompt: str) -> str:
-        url = ("https://generativelanguage.googleapis.com/v1beta/models/"
-               f"{self.model or 'gemini-2.5-flash-lite'}:generateContent")
-        # The key goes in a header: new "AQ." keys are rejected when sent as ?key=
-        r = requests.post(url, headers={"x-goog-api-key": self.key}, timeout=20, json={
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"}})
+        model = self.model or "gemini-3.5-flash-lite"
+        for _ in range(2):
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+            # The key goes in a header: new "AQ." keys are rejected when sent as ?key=
+            r = requests.post(url, headers={"x-goog-api-key": self.key}, timeout=20, json={
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"}})
+            # Google retires models over time and names the replacement in the error; follow it once.
+            m = re.search(r"use models/([\w.-]+)", r.text) if r.status_code == 404 else None
+            if m and m.group(1) != model:
+                model = self.model = m.group(1)
+                continue
+            break
         if r.status_code >= 400:
             raise RuntimeError(f"Gemini {r.status_code}: {r.text[:200]}")
         return r.json()["candidates"][0]["content"]["parts"][0]["text"]
