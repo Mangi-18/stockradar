@@ -42,6 +42,16 @@ portfolio alerts then show a 🤖 line with that reasoning, and the result feeds
 the evidence score. Invented symbols are discarded; only real NSE symbols are
 kept. `/ai` shows how many headlines it read today.
 
+## ⚡ Breaking alerts (any stock, first report)
+
+The fastest alert. When a single headline, or an NSE/BSE filing, is judged by
+the AI to mean a LARGE move (>5%) with 80%+ confidence, and the price hasn't
+reacted yet (<3% so far), you get it immediately, day or night, without
+waiting for other outlets. Filings are read by the AI within ~15 seconds of
+being posted, so this often beats every news site. Once per stock per day, at
+most 10 a day. Tune with `/set breakconf 0.75` and `/set maxbreak 15`. It is
+single-source, so sometimes wrong; the 📣 story alert is the confirmed version.
+
 ## 📣 Story alerts (any stock, not just yours)
 
 When 3 or more different outlets cover the same stock within 3 hours, the story

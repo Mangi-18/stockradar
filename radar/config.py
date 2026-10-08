@@ -86,3 +86,7 @@ AI_MAX_PER_DAY = int(_float("AI_MAX_PER_DAY", 400))  # stays inside free-tier da
 STORY_MIN_OUTLETS = int(_float("STORY_MIN_OUTLETS", 3))   # different outlets within STORY_WINDOW_H
 STORY_WINDOW_H = _float("STORY_WINDOW_H", 3)
 STORY_MAX_PER_DAY = int(_float("STORY_MAX_PER_DAY", 10))
+
+# --- ⚡ Breaking alerts: a single headline/filing the AI judges a LARGE, confident move ---
+BREAKING_MIN_CONF = _float("BREAKING_MIN_CONF", 0.8)   # 0-1
+BREAKING_MAX_PER_DAY = int(_float("BREAKING_MAX_PER_DAY", 10))

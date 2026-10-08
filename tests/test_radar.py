@@ -400,6 +400,52 @@ def test_story_alert_silent_when_ai_sees_no_impact():
     assert not any("Story" in m for m in r.sent)
 
 
+def _ai_fixed(sym, conf, mag="large", d="up"):
+    return lambda h, src, port: {"relevant": True, "priced_in": False, "impacts": [
+        {"symbol": sym, "direction": d, "magnitude": mag, "confidence": conf,
+         "order": "direct", "why": "order worth 40% of annual revenue"}]}
+
+
+def test_breaking_from_single_headline():
+    r = make_radar()
+    r.market_matcher = build_market_matcher({"ZENTEC": "Zen Technologies"})
+    r.names["ZENTEC"] = "Zen Technologies"
+    r.ai.key = "AQ.test"
+    r.ai.read = _ai_fixed("ZENTEC", 0.85)
+    r.handle_headline("Zen Technologies bags Rs 1,200 crore defence order", "ET", "")
+    brk = [m for m in r.sent if "BREAKING" in m]
+    assert len(brk) == 1 and "ZENTEC" in brk[0] and "↑" in brk[0] and "40%" in brk[0], r.sent
+    r.handle_headline("Zen Technologies order: details", "Mint", "")
+    assert len([m for m in r.sent if "BREAKING" in m]) == 1          # once per stock per day
+    assert not any("Opportunity" in m or "Story" in m for m in r.sent if "ZENTEC" in m and "BREAKING" not in m)
+
+
+def test_breaking_needs_high_confidence_and_no_prior_move():
+    r = make_radar()
+    r.market_matcher = build_market_matcher({"ZENTEC": "Zen Technologies"})
+    r.names["ZENTEC"] = "Zen Technologies"
+    r.ai.key = "AQ.test"
+    r.ai.read = _ai_fixed("ZENTEC", 0.7)
+    r.handle_headline("Zen Technologies bags defence order", "ET", "")
+    assert not any("BREAKING" in m for m in r.sent)
+    r2 = make_radar()
+    r2.market_matcher = r.market_matcher; r2.names["ZENTEC"] = "Zen Technologies"
+    r2.ai.key = "AQ.test"; r2.ai.read = _ai_fixed("ZENTEC", 0.9)
+    r2.day_change["ZENTEC"] = 4.5                                     # market already reacted
+    r2.handle_headline("Zen Technologies bags defence order", "ET", "")
+    assert not any("BREAKING" in m for m in r2.sent)
+
+
+def test_breaking_from_exchange_filing():
+    r = make_radar()
+    r.ai.key = "AQ.test"
+    r.ai.read = _ai_fixed("TINYCO", 0.88)
+    r.handle_filing({"id": "f9", "symbol": "TINYCO", "company": "Tiny Co", "headline": "Receipt of order worth Rs 450 crore",
+                     "category": "", "url": "http://f", "exchange": "NSE"})
+    brk = [m for m in r.sent if "BREAKING" in m]
+    assert len(brk) == 1 and "TINYCO" in brk[0] and "NSE filing" in brk[0]
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

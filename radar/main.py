@@ -95,6 +95,7 @@ class Radar:
         self.last_price = {}         # symbol -> latest price seen (for outcome tracking)
         self.stats, self._stats_at = {}, 0.0
         self._ai_cycle = 0
+        self._ai_filing_cycle = 0
         self.result_tries = {}
         self.warmed_up = set()
         self.names = {}              # symbol -> company name
@@ -179,6 +180,7 @@ class Radar:
         if s["score"] >= config.OPP_MIN_SCORE and not quiet_hours(now()):
             used = self.store.count_today("opp", day)
             if (used < config.OPP_MAX_PER_DAY and not self.store.has_seen(f"story:{day}:{sym}:sent")
+                    and not self.store.has_seen(f"brk:{day}:{sym}")
                     and self.store.first_time(f"opp:{day}:{sym}")):
                 self.tg.send(self.format_opportunity(sym, s, used + 1))
                 return
@@ -217,6 +219,7 @@ class Radar:
         return out
 
     def poll_filings(self) -> None:
+        self._ai_filing_cycle = 0
         sources = [("nse", self._nse_filings)]
         if self.bse:
             sources.append(("bse", self.bse.announcements))
@@ -259,6 +262,21 @@ class Radar:
                 msg += "\n⏳ Numbers follow as soon as NSE publishes them."
             self.notify(sym, msg, urgent=c["impact"] == HIGH)
         elif c["label"] != "Quarterly results":  # others' results are judged on the numbers
+            if c["impact"] == HIGH and self.ai.provider and self._ai_filing_cycle < 6:
+                # An exchange filing is the earliest public source. Ask the AI how big it is
+                # for THIS company (a ₹500 cr order is huge for a small cap, nothing for L&T).
+                self._ai_filing_cycle += 1
+                r = self.ai.read(f"{it.get('company') or sym} (NSE: {sym}) exchange filing — {c['label']}: "
+                                 f"{it['headline'][:400]}", f"{it['exchange']} filing", sorted(self.portfolio()))
+                i = next((x for x in (r or {}).get("impacts", []) if x["symbol"] == sym), None)
+                if i and i["confidence"] >= 0.5:
+                    up = i["direction"] == "up"
+                    strong = i["magnitude"] == "large" and i["confidence"] >= 0.7
+                    self.store.log_event(sym, "ai", f"AI: {'↑' if up else '↓'} {i['magnitude']} ({i['confidence']:.0%}) — "
+                                         f"{i['why']}", "+" if up else "-", HIGH if strong else MEDIUM, it["exchange"], it["url"])
+                    self.store.track(sym, "ai", f"AI {i['magnitude']}", 1 if up else -1)
+                    if not (r or {}).get("priced_in"):
+                        self.breaking_check(i, f"{c['label']}: {it['headline'][:300]}", f"{it['exchange']} filing", it["url"])
             self.consider(sym)
 
     # ================================================================== results
@@ -589,6 +607,10 @@ class Radar:
         for s in set(syms) | set(ai_by):
             if s not in mine_set:
                 self.consider(s)
+        if not a["already_moved"]:
+            for i in ai_imp:
+                if i["symbol"] not in mine_set:
+                    self.breaking_check(i, title, src, link)
         for s in syms:
             if s not in mine_set:
                 self.story_check(s, title, src, ai_by.get(s), a["already_moved"])
@@ -612,13 +634,45 @@ class Radar:
         elif a["global"] and a["dramatic"] and self.store.first_time(f"global:{int(time.time() // 3600)}"):
             self.tg.send(f"🌍 <b>Global cue</b>\n{esc(title)}\n{stamp}")
 
+    def breaking_check(self, i: dict, title: str, src: str, link: str) -> None:
+        """⚡ One headline or filing that the AI judges a LARGE move with high confidence.
+        Sent immediately, any time of day: this is the 'don't wait for confirmation' alert."""
+        sym = i["symbol"]
+        if (i["magnitude"] != "large" or i["confidence"] < config.BREAKING_MIN_CONF
+                or sym in self.store.muted() or sym in self.portfolio()):
+            return
+        day = now().strftime("%Y-%m-%d")
+        if (self.store.has_seen(f"brk:{day}:{sym}") or self.store.has_seen(f"opp:{day}:{sym}")
+                or self.store.has_seen(f"story:{day}:{sym}:sent")):
+            return
+        up = i["direction"] == "up"
+        dc = self.day_change.get(sym)
+        if dc is not None and (dc >= 3 if up else dc <= -3):
+            return  # the market already reacted; not early any more
+        if self.store.count_today("brk", day) >= config.BREAKING_MAX_PER_DAY:
+            self.store.queue(sym, f"⚡ <b>{esc(sym)}</b> {'↑' if up else '↓'} {esc(i['why'])}", 80)
+            return
+        self.store.first_time(f"brk:{day}:{sym}")
+        n = self.store.count_today("brk", day)
+        lines = [f"⚡ <b>BREAKING · {esc(sym)}</b> {'🟢 ↑' if up else '🔴 ↓'} large move likely "
+                 f"({i['confidence']:.0%} confidence)",
+                 f"🤖 {esc(i['why'])}",
+                 f"📰 {esc(title[:300])}",
+                 f"<i>{esc(src)} · {now().strftime('%H:%M:%S')}</i>"
+                 + (f" · price today {dc:+.1f}%" if dc is not None else "")]
+        if link:
+            lines.append(f'<a href="{esc(link)}">Source</a>')
+        lines.append(f"<i>Single source, not yet confirmed by other outlets. Breaking {n} of "
+                     f"{config.BREAKING_MAX_PER_DAY} today · /add {esc(sym)} · /mute {esc(sym)}</i>")
+        self.tg.send("\n".join(lines))
+
     def story_check(self, sym: str, title: str, src: str, ai_i, moved: bool) -> None:
         """📣 A stock outside your portfolio is being covered by several outlets at once.
         Send the headlines plus the AI's reading of what it means for the price."""
         day = now().strftime("%Y-%m-%d")
         key = f"story:{day}:{sym}"
         if sym in self.store.muted() or self.store.get(key) or quiet_hours(now()) \
-                or self.store.has_seen(f"opp:{day}:{sym}"):  # already sent as a 🎯 opportunity today
+                or self.store.has_seen(f"opp:{day}:{sym}") or self.store.has_seen(f"brk:{day}:{sym}"):
             return
         outlets = self.store.news_by_source(sym, config.STORY_WINDOW_H)
         if len(outlets) < config.STORY_MIN_OUTLETS:
@@ -820,6 +874,8 @@ class Radar:
         "gap": ("PREOPEN_MIN_GAP", float, "% pre-open gap for your stocks"),
         "outlets": ("STORY_MIN_OUTLETS", int, "outlets covering a stock before a 📣 story alert"),
         "maxstory": ("STORY_MAX_PER_DAY", int, "max 📣 story alerts per day"),
+        "breakconf": ("BREAKING_MIN_CONF", float, "AI confidence (0-1) needed for a ⚡ breaking alert"),
+        "maxbreak": ("BREAKING_MAX_PER_DAY", int, "max ⚡ breaking alerts per day"),
     }
 
     def apply_saved_settings(self) -> None:
