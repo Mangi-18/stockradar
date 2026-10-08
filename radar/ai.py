@@ -41,6 +41,19 @@ Reply with JSON only:
                "confidence": 0.0, "order": "direct|second-order", "why": "..."}}]}}"""
 
 
+SUMMARY_PROMPT = """You are an Indian equity analyst. Below are the recent news items about {company}
+(NSE: {symbol}), newest first. Weigh ALL of them together: positives against negatives, how
+material each one is for THIS company's earnings and share price, and how recent it is.
+Ignore items that only report a price move that already happened.
+
+{items}
+
+Reply with JSON only:
+{{"direction": "up|down|mixed|none", "confidence": 0.0,
+  "positives": ["short phrase", ...], "negatives": ["short phrase", ...],
+  "summary": "one or two plain sentences on the net picture"}}"""
+
+
 class AIReader:
     def __init__(self, key: str = "", max_per_day: int = 400, min_gap_s: float = 4.5):
         self.key = key or ""
@@ -86,6 +99,33 @@ class AIReader:
             self.errors += 1
             self.last_error = str(e)[:300]
             log.warning("ai read failed: %s", e)
+            return None
+
+    def summarize(self, symbol: str, company: str, items: list) -> dict:
+        """items: [(tone, headline, source)] newest first. One overall reading, or None."""
+        if not self.budget_left() or not items:
+            return None
+        wait = self.min_gap_s - (time.time() - self.last_call)
+        if wait > 0:
+            time.sleep(wait)
+        self.last_call = time.time()
+        self.calls_today += 1
+        lines = "\n".join(f"- {h} ({src})" for _t, h, src in items[:15])
+        prompt = SUMMARY_PROMPT.format(company=company or symbol, symbol=symbol, items=lines)
+        try:
+            text = self._gemini(prompt) if self.provider == "gemini" else self._groq(prompt)
+            m = re.search(r"\{.*\}", text, re.S)
+            d = json.loads(m.group(0) if m else text)
+            self.errors = 0
+            return {"direction": str(d.get("direction", "none")).lower(),
+                    "confidence": max(0.0, min(1.0, float(d.get("confidence", 0) or 0))),
+                    "positives": [str(x)[:120] for x in (d.get("positives") or [])][:4],
+                    "negatives": [str(x)[:120] for x in (d.get("negatives") or [])][:4],
+                    "summary": str(d.get("summary", ""))[:400]}
+        except Exception as e:
+            self.errors += 1
+            self.last_error = str(e)[:300]
+            log.warning("ai summary failed: %s", e)
             return None
 
     def _gemini(self, prompt: str) -> str:

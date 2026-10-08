@@ -172,7 +172,8 @@ def parse_rss(xml_bytes: bytes) -> list:
                     link = c.get("href")
         title = re.sub(r"\s+", " ", get.get("title", "")).strip()
         if title:
-            items.append({"title": title, "link": link, "id": get.get("guid") or link or title})
+            items.append({"title": title, "link": link, "id": get.get("guid") or link or title,
+                          "date": get.get("pubDate") or get.get("published") or get.get("updated") or ""})
     return items
 
 
@@ -193,3 +194,32 @@ class NewsFeeds:
                 yield url, parse_rss(r.content)
             except Exception as e:
                 yield url, e
+
+
+def rss_time(raw: str):
+    """RSS/Atom date -> epoch seconds, or None."""
+    from email.utils import parsedate_to_datetime
+    from datetime import datetime
+    if not raw:
+        return None
+    try:
+        return parsedate_to_datetime(raw).timestamp()
+    except (TypeError, ValueError):
+        try:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+
+
+def search_company_news(session, company: str, symbol: str, days: int = 3, timeout: float = 8) -> list:
+    """On-demand: recent headlines about one company from Google News (hundreds of Indian outlets)."""
+    from urllib.parse import quote_plus
+    q = f'"{company}" OR {symbol} share when:{days}d'
+    url = f"https://news.google.com/rss/search?q={quote_plus(q)}&hl=en-IN&gl=IN&ceid=IN:en"
+    r = session.get(url, timeout=timeout)
+    r.raise_for_status()
+    out = []
+    for it in parse_rss(r.content)[:25]:
+        title, src = split_source(it["title"], "Google News")
+        out.append({"title": title, "source": src, "link": it["link"], "ts": rss_time(it["date"])})
+    return out

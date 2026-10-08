@@ -680,6 +680,44 @@ def test_portfolio_view_is_compact():
     assert "❌ CUPID" in str(rows2)
 
 
+# ---------------------------------------------------------------- type a stock to look it up
+def test_type_stock_name_gets_report():
+    import time
+    r = make_radar(["TCS"])
+    r.names.update({"INDIGO": "InterGlobe Aviation Limited", "IGL": "Indraprastha Gas Limited",
+                    "TCS": "Tata Consultancy Services Limited"})
+    assert r.resolve_stock("tcs") == ["TCS"]
+    assert r.resolve_stock("Interglobe") == ["INDIGO"]
+    assert r.resolve_stock("indigo") == ["INDIGO"]
+    r.store.log_event("INDIGO", "filing", "Red flag: DGCA grounds 40 aircraft", "-", "HIGH", "NSE")
+    fetched = [{"title": "IndiGo adds 10 new international routes", "source": "Mint", "link": "http://m",
+                "ts": time.time() - 3600},
+               {"title": "IndiGo shares slump on engine trouble", "source": "ET", "link": "http://e",
+                "ts": time.time() - 1800}]
+    M.search_company_news = lambda *a, **k: fetched
+    r.ai.key = "AQ.test"
+    r.ai.summarize = lambda sym, co, items: {"direction": "down", "confidence": 0.7,
+                                             "positives": ["new routes"], "negatives": ["groundings"],
+                                             "summary": "Groundings outweigh expansion."}
+    r.tg.commands = lambda: [{"type": "text", "text": "indigo", "chat": "1"}]
+    r.handle_commands()
+    out = r.sent[-1]
+    assert "INDIGO" in out and "Overall (24h)" in out and "negative" in out, out
+    assert "AI's net reading" in out and "➕ new routes" in out and "➖ groundings" in out
+    assert "new international routes" in out and "DGCA grounds" in out
+
+
+def test_ambiguous_name_offers_choices():
+    r = make_radar()
+    r.names.update({"TATASTEEL": "Tata Steel Limited", "TATAPOWER": "Tata Power Company Limited",
+                    "TATAMOTORS": "Tata Motors Limited"})
+    sent_buttons = []
+    r.tg.send = lambda m, buttons=None, reply_keyboard=None, chat=None: (r.sent.append(m), sent_buttons.append(buttons))
+    r.tg.commands = lambda: [{"type": "text", "text": "tata", "chat": "1"}]
+    r.handle_commands()
+    assert "Which one" in r.sent[-1] and len(sent_buttons[-1]) == 3
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

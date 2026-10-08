@@ -158,6 +158,16 @@ evidence score is 70+ or the AI is 80%+ confident. No count limit; it can be 0
 stocks or 20. Each shows the agreement %, evidence score, AI confidence, today's
 move and the biggest factor, with ⏱️ if it has already moved a lot.
 
+## 🔎 Type any stock
+
+Type a stock's symbol or name (`tcs`, `indigo`, `tata steel`) as a message to get:
+price and today's move, the **overall verdict** for 24 hours (and 3 days if
+different) combining positive and negative news, the **AI's net reading** with
+the main positives ➕ and negatives ➖, and the latest 10 news items with each
+one's tone. News comes from the engine's own history plus a fresh Google News
+search, so it works for any NSE stock, not only ones you track. If the name
+matches several companies, you get buttons to pick.
+
 ## 📡 Telegram channels
 
 The owner can add **public** Telegram channels (☰ More → 📡 Channels → ➕ Add

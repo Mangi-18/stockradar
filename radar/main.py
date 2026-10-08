@@ -22,8 +22,8 @@ from .bse import BSE
 from .channels import Channels, clean_name
 from .classify import HIGH, MEDIUM, classify
 from .outlook import outlook, short
-from .news import (DEFAULT_FEEDS, NewsFeeds, analyse_headline, build_market_matcher,
-                   build_matcher, split_source)
+from .news import (ALIASES, DEFAULT_FEEDS, NewsFeeds, analyse_headline, build_market_matcher,
+                   build_matcher, search_company_news, split_source, tone)
 from .nse import NSE
 from .results import analyse, crore
 from .scoring import score_events
@@ -159,7 +159,8 @@ class Radar:
         self.stats, self._stats_at = {}, 0.0
         self._ai_cycle = 0
         self._ai_filing_cycle = 0
-        self._story_ai = {}          # (day, symbol) -> AI reading used for 📣 story alerts
+        self._story_ai = {}
+        self._report_cache = {}      # symbol -> (time, fetched headlines, AI summary)          # (day, symbol) -> AI reading used for 📣 story alerts
         self.awaiting = {}           # chat -> what their next typed message means
         self.result_tries = {}
         self.warmed_up = set()
@@ -1171,6 +1172,116 @@ class Radar:
         rows.append([(f"🌙 Quiet hours: {quiet} (tap to switch)", "quiet:toggle")])
         return "⚙️ <b>Your settings</b>\nTap ➕ / ➖ to change. Applies immediately, only to you.", rows
 
+    # ================================================================== stock lookup
+    def resolve_stock(self, text: str) -> list:
+        """'tcs', 'Tata Consultancy', 'indigo', 'LIC' -> candidate NSE symbols (best first)."""
+        q = re.sub(r"[^a-z0-9& ]", " ", text.lower()).strip()
+        q = re.sub(r"\s+", " ", q)
+        if not q or len(q) < 2:
+            return []
+        up = q.upper().replace(" ", "")
+        if up in self.names or up in self.portfolio():
+            return [up]
+        for sym, al in ALIASES.items():
+            if q in al:
+                return [sym]
+        starts, contains = [], []
+        for sym, name in self.names.items():
+            n = re.sub(r"\s+", " ", re.sub(r"[^a-z0-9& ]", " ", (name or "").lower())).strip()
+            if not n:
+                continue
+            if n.startswith(q) or sym.lower().startswith(q.replace(" ", "")):
+                starts.append(sym)
+            elif len(q) >= 4 and f" {q}" in f" {n}":
+                contains.append(sym)
+        starts.sort(key=lambda s: (len(self.names.get(s, "")), s))
+        return (starts + sorted(contains))[:8]
+
+    def stock_report(self, u: User, sym: str):
+        """Everything we know about one stock: overall verdict (positives AND negatives),
+        AI's net reading, price today, and the latest news with each item's tone."""
+        company = self.names.get(sym, "") or sym
+        stored = self.store.events_for(sym, 72)
+        # Fresh headlines from Google News (cached 20 min), so even stocks nobody tracks have news
+        cached = self._report_cache.get(sym)
+        if cached and time.time() - cached[0] < 1200:
+            fetched, summary = cached[1], cached[2]
+        else:
+            fetched, summary = [], None
+            try:
+                fetched = search_company_news(self.news.s, re.sub(r"\s+(limited|ltd\.?)$", "", company, flags=re.I), sym)
+            except Exception as e:
+                log.warning("news search %s: %s", sym, e)
+        known = {e["headline"][:80].lower() for e in stored}
+        events = list(stored)
+        for f in fetched:
+            if f["title"][:80].lower() in known or not f["ts"] or time.time() - f["ts"] > 72 * 3600:
+                continue
+            c = classify(f["title"])
+            t = tone(f["title"])
+            t = t if t != "?" else c["tone"]
+            events.append({"ts": f["ts"], "symbol": sym, "kind": "news", "headline": f["title"], "tone": t,
+                           "impact": c["impact"] if c["impact"] != "LOW" or t == "?" else MEDIUM,
+                           "source": f["source"], "url": f["link"]})
+            known.add(f["title"][:80].lower())
+        events.sort(key=lambda e: e["ts"])
+        o = outlook([e for e in events if time.time() - e["ts"] <= 24 * 3600])
+        o3 = outlook(events)
+        if summary is None and self.ai.provider and events:
+            items = [(e["tone"], short(e, 160), e["source"]) for e in reversed(events)
+                     if e["kind"] in ("news", "filing", "results", "insider", "deal", "ai", "tgnews")]
+            summary = self.ai.summarize(sym, company, items)
+        self._report_cache[sym] = (time.time(), fetched, summary)
+
+        dc = self.day_change.get(sym)
+        price = self.last_price.get(sym)
+        if dc is None:
+            try:
+                q = self.nse.quote(sym)
+                dc, price = float(q["pChange"]), float(q["lastPrice"])
+            except Exception:
+                pass
+        star = "⭐ " if sym in u.portfolio() else ""
+        lines = [f"🔎 {star}<b>{esc(sym)}</b> · {esc(company)}"
+                 + (f"\nPrice ₹{price:,.2f} · today {dc:+.2f}%" if price is not None and dc is not None else "")]
+        if o["label"]:
+            lines.append(f"📊 <b>Overall (24h): {o['label']}</b> · {o['pos']} positive vs {o['neg']} negative")
+        if o3["label"] and o3["label"] != o["label"]:
+            lines.append(f"📊 3-day view: {o3['label']} · {o3['pos']} positive vs {o3['neg']} negative")
+        if not o["label"] and not o3["label"]:
+            lines.append("📊 No price-relevant news in the last 3 days.")
+        if summary and summary["direction"] in ("up", "down", "mixed"):
+            arrow = {"up": "🟢 ↑ net positive", "down": "🔴 ↓ net negative", "mixed": "🟡 mixed"}[summary["direction"]]
+            lines.append(f"\n🤖 <b>AI's net reading:</b> {arrow} ({summary['confidence']:.0%} confident)")
+            if summary["summary"]:
+                lines.append(f"   {esc(summary['summary'])}")
+            for p in summary["positives"][:3]:
+                lines.append(f"   ➕ {esc(p)}")
+            for n in summary["negatives"][:3]:
+                lines.append(f"   ➖ {esc(n)}")
+        if events:
+            lines.append("\n<b>Latest news</b>")
+            for e in list(reversed(events))[:10]:
+                when = datetime.fromtimestamp(e["ts"], IST).strftime("%d %b %H:%M")
+                link = f' <a href="{esc(e["url"])}">↗</a>' if e.get("url") else ""
+                lines.append(f"{TONE.get(e['tone'], '🟡')} {esc(short(e, 140))} <i>({esc(e['source'] or e['kind'])}, {when})</i>{link}")
+        lines.append("<i>Verdict combines all items, weighted by importance and recency. Not a guarantee.</i>")
+        held = sym in u.portfolio()
+        buttons = [[("❌ Remove from portfolio" if held else f"➕ Add {sym} to portfolio", f"rmq:{sym}" if held else f"add:{sym}"),
+                    ("🔄 Refresh", f"stock:{sym}")]]
+        return lines, buttons
+
+    def send_stock(self, u: User, sym: str, refresh: bool = False) -> None:
+        if refresh:
+            self._report_cache.pop(sym, None)
+        lines, buttons = self.stock_report(u, sym)
+        text = "\n".join(lines)
+        if len(text) > 3900:
+            u.send_long(lines)
+            u.send("⬆️", buttons=buttons)
+        else:
+            u.send(text, buttons=buttons)
+
     def high_certainty(self, u: User, hours: float = 24) -> list:
         """Stocks where the evidence clearly points one way: most signals agree, the combined
         weight is large, and either the evidence score or the AI's confidence is high.
@@ -1284,6 +1395,7 @@ class Radar:
             "📊 Every alert about your stock shows its <b>overall</b> verdict from all of today's news, "
             "so one green or red item never misleads you. 🔄 tells you when that verdict flips.\n"
             "✅ <b>High certainty</b> lists only the stocks where the evidence clearly points one way.\n\n"
+            "🔎 Type any stock's name or symbol (e.g. <code>indigo</code>) to get its news and overall verdict.\n\n"
             "Start by tapping ⭐ Portfolio → ✏️ Edit portfolio → ➕ Add stocks. "
             "Paste any headline as a message and the AI tells you what it means for stocks.")
 
@@ -1349,6 +1461,12 @@ class Radar:
         elif kind == "mute":
             self.store.mute(rest, True, u.chat)
             toast = f"🔇 {rest} muted"
+        elif kind == "stock":
+            self.send_stock(u, rest, refresh=True)
+        elif kind == "rmq":
+            self.store.watch_remove(rest, u.chat)
+            self.rebuild_matcher()
+            toast = f"Removed {rest} from your portfolio"
         elif kind == "brief":
             u.send_long(self.brief(now() - timedelta(hours=float(rest)), f"News brief · last {rest}h", user=u))
         elif kind == "prompt":
@@ -1381,9 +1499,19 @@ class Radar:
                 return self.on_text(u, "/setkey " + text)
             if waiting == "channel":
                 return self.on_text(u, "/addchannel " + text)
-            if waiting == "ask" or len(text) >= 15:  # any pasted headline = ask the AI
+            if waiting == "ask":
                 return self.cmd_ask(u, text)
-            return u.send("Use the buttons below the typing box, or paste a news headline.", reply_keyboard=self.PANEL)
+            if len(text) <= 40 and len(text.split()) <= 5:  # looks like a stock name or symbol
+                cands = self.resolve_stock(text)
+                if len(cands) == 1:
+                    return self.send_stock(u, cands[0])
+                if cands:
+                    return u.send(f"Which one did you mean?", buttons=[
+                        [(f"{c} · {(self.names.get(c) or '')[:28]}", f"stock:{c}")] for c in cands])
+            if len(text) >= 15:  # a pasted headline: ask the AI what it means
+                return self.cmd_ask(u, text)
+            return u.send("I couldn't find that stock. Type its NSE symbol (e.g. <code>TCS</code>) or company name, "
+                          "or paste a news headline.", reply_keyboard=self.PANEL)
         parts = text.split()
         cmd = parts[0].lower().split("@")[0]
         args = [p.upper().strip(",") for p in parts[1:]]
