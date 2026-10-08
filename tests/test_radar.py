@@ -615,6 +615,71 @@ def test_add_channel_owner_only():
     assert r.channel_list() == ["mktnews"] and "Now reading @mktnews" in r.sent[-1]
 
 
+# ---------------------------------------------------------------- overall outlook + high certainty
+from radar.outlook import outlook  # noqa: E402
+
+
+def _ev(kind, tone, impact="HIGH", headline="h", ago_h=0.0, source="X"):
+    import time
+    return {"ts": time.time() - ago_h * 3600, "symbol": "S", "kind": kind, "headline": headline,
+            "tone": tone, "impact": impact, "source": source, "url": ""}
+
+
+def test_outlook_nets_positive_and_negative():
+    o = outlook([_ev("news", "+", "MEDIUM", "INDIGO adds new routes"),
+                 _ev("filing", "-", "HIGH", "Red flag: DGCA grounds 40 aircraft"),
+                 _ev("ai", "-", "HIGH", "AI: ↓ large (85%) — grounding cuts capacity [DGCA grounds]"),
+                 _ev("news", "-", "HIGH", "Engine issues hit IndiGo fleet")])
+    assert o["sign"] == -1 and "negative" in o["label"] and o["pos"] == 1 and o["neg"] == 3
+    assert "Strongly" in o["label"], o
+    mixed = outlook([_ev("news", "+", "HIGH", "a"), _ev("news", "-", "HIGH", "b")])
+    assert mixed["label"] == "🟡 Mixed" and mixed["sign"] == 0
+
+
+def test_outlook_old_news_counts_less():
+    fresh_neg = outlook([_ev("filing", "+", "HIGH", "old good", ago_h=40), _ev("filing", "-", "HIGH", "new bad")])
+    assert fresh_neg["sign"] == -1
+
+
+def test_portfolio_alert_shows_overall_and_flip():
+    r = make_radar(["INDIGO"])
+    r.names["INDIGO"] = "InterGlobe Aviation"; r.rebuild_matcher()
+    for i, h in enumerate(["INDIGO shares hit by fuel price spike", "INDIGO faces DGCA probe"]):
+        r.store.log_event("INDIGO", "news", h, "-", "HIGH", f"S{i}")
+    r.store.set("outlook:INDIGO", "-1")
+    r.handle_headline("INDIGO bags record Diwali bookings, outlook upgrade", "ET", "")
+    msg = [m for m in r.sent if "⭐ INDIGO" in m][-1]
+    assert "Overall (24h)" in msg and ("negative" in msg or "Mixed" in msg), msg
+    # enough good news flips the verdict -> flip notice
+    for i in range(4):
+        r.store.log_event("INDIGO", "filing", f"Order win: big contract {i}", "+", "HIGH", "NSE")
+    r.handle_headline("INDIGO wins government contract", "BS", "")
+    assert "Outlook flipped to positive" in r.sent[-1], r.sent[-1]
+
+
+def test_high_certainty_lists_only_clear_cases():
+    r = make_radar(["TCS"])
+    for src in ("ET", "Mint", "BS"):
+        r.store.log_event("ZENTEC", "news", "Zen Technologies bags big order", "+", "HIGH", src)
+    r.store.log_event("ZENTEC", "filing", "Order win: Rs 1,200 cr order", "+", "HIGH", "NSE")
+    r.store.log_event("ZENTEC", "ai", "AI: ↑ large (88%) — order is 40% of revenue [x]", "+", "HIGH", "NSE")
+    r.store.log_event("MIXCO", "news", "MixCo good news", "+", "HIGH", "ET")
+    r.store.log_event("MIXCO", "news", "MixCo bad news", "-", "HIGH", "BS")
+    items = r.high_certainty(r.owner)
+    assert [i["symbol"] for i in items] == ["ZENTEC"], items
+    lines, rows = r.certainty_view(r.owner)
+    assert "ZENTEC" in "\n".join(lines) and rows and "add:ZENTEC" in rows[0][0][1]
+
+
+def test_portfolio_view_is_compact():
+    r = make_radar(["TCS", "LICI", "CUPID"])
+    r.store.log_event("TCS", "filing", "Results: profit up", "+", "HIGH", "NSE")
+    text, rows = r.portfolio_view(r.owner)
+    assert "TCS" in text and "No news: CUPID, LICI" in text and "❌" not in str(rows)
+    text2, rows2 = r.portfolio_edit_view(r.owner)
+    assert "❌ CUPID" in str(rows2)
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

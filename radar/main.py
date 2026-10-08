@@ -21,6 +21,7 @@ from .ai import AIReader
 from .bse import BSE
 from .channels import Channels, clean_name
 from .classify import HIGH, MEDIUM, classify
+from .outlook import outlook, short
 from .news import (DEFAULT_FEEDS, NewsFeeds, analyse_headline, build_market_matcher,
                    build_matcher, split_source)
 from .nse import NSE
@@ -241,10 +242,45 @@ class Radar:
             {s: n for s, n in self.names.items() if s not in close})
 
     # ================================================================== routing
+    def outlook_of(self, sym: str) -> dict:
+        return outlook(self.store.events_for(sym, 24))
+
+    def outlook_line(self, sym: str, o: dict = None) -> str:
+        o = o or self.outlook_of(sym)
+        if not o["label"]:
+            return ""
+        line = f"📊 <b>Overall (24h): {o['label']}</b> · {o['pos']} positive vs {o['neg']} negative"
+        if o["sign"] and o["drivers"].get(o["sign"]):
+            line += f"\n   Biggest factor: {esc(short(o['drivers'][o['sign']]))}"
+        return line
+
+    def with_outlook(self, sym: str, text: str) -> tuple:
+        """Puts the stock's overall verdict right under the alert's first line, so a single
+        green or red item is never read on its own. Also detects a flip of the verdict."""
+        o = self.outlook_of(sym)
+        line = self.outlook_line(sym, o)
+        flipped = False
+        if o["sign"]:
+            prev = self.store.get(f"outlook:{sym}")
+            if prev and int(prev) == -o["sign"]:
+                flipped = True
+                line = (f"🔄 <b>Outlook flipped to {'positive 🟢' if o['sign'] > 0 else 'negative 🔴'}</b>\n" + line)
+            self.store.set(f"outlook:{sym}", o["sign"])
+        if not line:
+            return text, False
+        first, _, rest = text.partition("\n")
+        return f"{first}\n{line}" + (f"\n{rest}" if rest else ""), flipped
+
     def notify(self, sym: str, text: str, urgent: bool = False) -> None:
         """Portfolio alerts, to everyone who holds the stock. Urgent ones always go out;
-        routine ones respect each person's quiet hours and per-stock cooldown."""
-        for u in self.holders(sym):
+        routine ones respect each person's quiet hours and per-stock cooldown. Every alert
+        carries the stock's overall verdict; a flip of that verdict is always urgent."""
+        holders = self.holders(sym)
+        if not holders:
+            return
+        text, flipped = self.with_outlook(sym, text)
+        urgent = urgent or flipped
+        for u in holders:
             if not urgent:
                 cooling = False
                 cd = u.cfg("cooldown")
@@ -413,10 +449,10 @@ class Radar:
                 continue
             if a["score"]:
                 self.store.track(sym, "results", a["verdict"], 1 if a["score"] > 0 else -1)
-            self.notify(sym, self.format_result(sym, kind, a), urgent=True)
             tone = "+" if a["score"] > 0 else "-" if a["score"] < 0 else "?"
             self.store.log_event(sym, "results", f"Q results {a['verdict']} ({a['score']:+d}): "
                                  + "; ".join(a["reasons"]), tone, HIGH if abs(a["score"]) >= 3 else MEDIUM, "NSE")
+            self.notify(sym, self.format_result(sym, kind, a), urgent=True)
             self.consider(sym)
         self.warmed_up.add("results")
 
@@ -475,12 +511,12 @@ class Radar:
             sig = self.momentum.update(sym, price, vol, t.timestamp())
             if sig and self.store.first_time(f"burst:{today}:{t.hour}:{sym}:{'+' if sig['move'] > 0 else '-'}"):
                 vtxt = f", volume {sig['vol_ratio']:.1f}× normal pace" if sig["strong"] else ""
+                self.store.log_event(sym, "burst", f"Price {sig['move']:+.1f}% in {sig['minutes']:.0f} min{vtxt}",
+                                     "+" if sig["move"] > 0 else "-", MEDIUM, "NSE")
                 if sym in held:
                     self.notify(sym, f"🚀 <b>⭐ {esc(sym)}</b> {sig['move']:+.1f}% in {sig['minutes']:.0f} min{vtxt} "
                                      f"· day {chg:+.1f}% · ₹{price:,.2f}\n" + "\n".join(self._reasons(sym)),
                                 urgent=sig["strong"])
-                self.store.log_event(sym, "burst", f"Price {sig['move']:+.1f}% in {sig['minutes']:.0f} min{vtxt}",
-                                     "+" if sig["move"] > 0 else "-", MEDIUM, "NSE")
                 self.consider(sym)
             if sym in held:
                 crossed = [lv for lv in config.MOVE_LEVELS if abs(chg) >= lv]
@@ -569,10 +605,10 @@ class Radar:
                 continue
             what = f"Promoter {'bought' if buy else 'sold'} ₹{value_cr:,.1f} cr ({who})"
             self.store.add_filing(sym, what, HIGH, "")
+            self.store.log_event(sym, "insider", what, "+" if buy else "-", HIGH, "NSE")
             self.notify(sym, f"{'🟢' if buy else '🔴'} <b>⭐ {esc(sym)}</b> · {esc(what)} via "
                              f"{esc(r.get('acqMode') or 'market')}", urgent=True)
             if buy:
-                self.store.log_event(sym, "insider", what, "+", HIGH, "NSE")
                 self.store.track(sym, "insider", "promoter buy", 1)
                 self.consider(sym)
         self.warmed_up.add("insider")
@@ -599,9 +635,10 @@ class Radar:
                 continue
             what = f"{r['kind']} deal: {r.get('clientName')} {side} ₹{value_cr:,.0f} cr @ ₹{px:,.2f}"
             self.store.add_filing(sym, what, MEDIUM, "")
+            self.store.log_event(sym, "deal", what, "+" if side == "BUY" else "-" if side == "SELL" else "?",
+                                 MEDIUM, "NSE")
             self.notify(sym, f"🐋 <b>⭐ {esc(sym)}</b> · {esc(what)}")
             if side == "BUY":
-                self.store.log_event(sym, "deal", what, "+", MEDIUM, "NSE")
                 self.store.track(sym, "deal", "bulk/block buy", 1)
                 self.consider(sym)
         self.warmed_up.add("deals")
@@ -979,10 +1016,10 @@ class Radar:
         for e in ev:
             if e["symbol"] in mine:
                 per.setdefault(e["symbol"], []).append(e)
-        for s in sorted(per, key=lambda k: -len(per[k])):
-            items = per[s]
-            net = sum({"+": 1, "-": -1}.get(e["tone"], 0) for e in items)
-            out.append(f"{'🟢' if net > 0 else '🔴' if net < 0 else '🟡'} <b>{esc(s)}</b> · {len(items)} items")
+        looks = {s: self.outlook_of(s) for s in per}
+        for s in sorted(per, key=lambda k: -abs(looks[k]["net"])):
+            items, o = per[s], looks[s]
+            out.append(f"<b>{esc(s)}</b> · {o['label'] or '🟡 Neutral'} ({o['pos']}+ / {o['neg']}−)")
             for e in items[-2:]:
                 out.append(f"   {esc(e['headline'][:150])}")
         if mine and not per:
@@ -1103,14 +1140,15 @@ class Radar:
         sys.exit(0)  # systemd (or run.sh on Termux) restarts the engine with the new code
 
     # ================================================================== buttons & menu
-    MENU = [("menu", "Show the button panel"), ("portfolio", "Your stocks: view, add, remove"),
+    MENU = [("menu", "Show the button panel"), ("sure", "Only the stocks where the evidence clearly points one way"),
+            ("portfolio", "Your stocks with their overall verdict"),
             ("top", "Strongest candidates right now"), ("brief", "News summary (pick hours)"),
             ("digest", "Get held-back items now"), ("ask", "Ask the AI about any headline"),
             ("settings", "Change your limits with ➕ / ➖ buttons"), ("learn", "How past signals played out"),
             ("status", "Health check")]
-    PANEL = [["🎯 Top", "🗞️ Brief", "⭐ Portfolio"], ["🤖 Ask AI", "⚙️ Settings", "📥 Digest"],
-             ["📊 Learn", "🩺 Status", "☰ More"]]
-    PANEL_MAP = {"🎯 Top": "/top", "🗞️ Brief": "/brief", "⭐ Portfolio": "/portfolio", "🤖 Ask AI": "/ask",
+    PANEL = [["✅ High certainty", "⭐ Portfolio", "🗞️ Brief"], ["🎯 Top", "🤖 Ask AI", "📥 Digest"],
+             ["⚙️ Settings", "📊 Learn", "☰ More"]]
+    PANEL_MAP = {"✅ High certainty": "/sure", "🎯 Top": "/top", "🗞️ Brief": "/brief", "⭐ Portfolio": "/portfolio", "🤖 Ask AI": "/ask",
                  "⚙️ Settings": "/settings", "📥 Digest": "/digest", "📊 Learn": "/learn",
                  "🩺 Status": "/status", "☰ More": "/more"}
     STEPS = {  # setting -> (button label, step, min, max)
@@ -1133,9 +1171,80 @@ class Radar:
         rows.append([(f"🌙 Quiet hours: {quiet} (tap to switch)", "quiet:toggle")])
         return "⚙️ <b>Your settings</b>\nTap ➕ / ➖ to change. Applies immediately, only to you.", rows
 
+    def high_certainty(self, u: User, hours: float = 24) -> list:
+        """Stocks where the evidence clearly points one way: most signals agree, the combined
+        weight is large, and either the evidence score or the AI's confidence is high.
+        No count limit: it can be 0 stocks or 20."""
+        muted = u.muted()
+        syms = {e["symbol"] for e in self.store.events_since(time.time() - hours * 3600)
+                if e["symbol"] and e["symbol"] not in muted}
+        out = []
+        for s in syms:
+            evs = self.store.events_for(s, hours)
+            o = outlook(evs)
+            if not o["sign"] or abs(o["ratio"]) < 0.75 or abs(o["net"]) < 3:
+                continue
+            sc = score_events(evs, self.day_change.get(s))
+            if sc["direction"] not in (0, o["sign"]):
+                continue
+            if sc["score"] < 70 and o["ai_conf"] < 0.8:
+                continue
+            very = abs(o["net"]) >= 6 and abs(o["ratio"]) >= 0.85 and (sc["score"] >= 80 or o["ai_conf"] >= 0.85)
+            out.append({"symbol": s, "o": o, "score": sc["score"], "very": very})
+        return sorted(out, key=lambda x: (not x["very"], -abs(x["o"]["net"])))
+
+    def certainty_view(self, u: User):
+        items = self.high_certainty(u)
+        mine = u.portfolio()
+        if not items:
+            return (["✅ <b>High certainty</b>",
+                     "Nothing right now. A stock appears here only when most of the last 24h's signals point "
+                     "the same way and the evidence is strong."], [])
+        lines = [f"✅ <b>High certainty</b> · {len(items)} stock{'s' if len(items) != 1 else ''} (last 24h)",
+                 "<i>Most signals agree and the evidence is strong. Strong evidence, not a guarantee.</i>"]
+        for it in items:
+            s, o = it["symbol"], it["o"]
+            arrow = "🟢 ↑" if o["sign"] > 0 else "🔴 ↓"
+            agree = round(100 * (o["pos"] if o["sign"] > 0 else o["neg"]) / max(1, o["pos"] + o["neg"]))
+            dc = self.day_change.get(s)
+            moved = dc is not None and dc * o["sign"] >= 5
+            lines.append(f"\n{arrow} {'⭐ ' if s in mine else ''}<b>{esc(s)}</b> · "
+                         f"{'Very high' if it['very'] else 'High'} conviction")
+            lines.append(f"   {agree}% of signals agree · evidence {it['score']:.0f}/100"
+                         + (f" · AI {o['ai_conf']:.0%}" if o["ai_conf"] else "")
+                         + (f" · today {dc:+.1f}%" if dc is not None else ""))
+            if o["drivers"].get(o["sign"]):
+                lines.append(f"   {esc(short(o['drivers'][o['sign']], 110))}")
+            if moved:
+                lines.append("   ⏱️ Already moved a lot today; may be late.")
+        add = [it["symbol"] for it in items if it["symbol"] not in mine][:6]
+        return lines, [[(f"➕ {s}", f"add:{s}") for s in add[i:i + 3]] for i in range(0, len(add), 3)]
+
     def portfolio_view(self, u: User):
+        """Your stocks ranked by how much is going on, with each one's overall verdict.
+        Quiet stocks are collapsed into one line. Editing is behind ✏️ Edit."""
+        mine = sorted(u.portfolio())
+        if not mine:
+            return ("⭐ <b>Your portfolio</b> is empty. Tap ➕ Add stocks.", [[("➕ Add stocks", "prompt:add")]])
+        looks = {s: self.outlook_of(s) for s in mine}
+        active = sorted([s for s in mine if looks[s]["label"]], key=lambda s: -abs(looks[s]["net"]))
+        quiet = [s for s in mine if not looks[s]["label"]]
+        lines = [f"⭐ <b>Your portfolio</b> · overall verdict from the last 24h"]
+        for s in active:
+            o = looks[s]
+            dc = self.day_change.get(s)
+            lines.append(f"<b>{esc(s)}</b> · {o['label']} ({o['pos']}+ / {o['neg']}−)"
+                         + (f" · today {dc:+.1f}%" if dc is not None else ""))
+            d = o["drivers"].get(o["sign"]) or o["drivers"].get(1) or o["drivers"].get(-1)
+            if d:
+                lines.append(f"   {esc(short(d, 100))}")
+        if quiet:
+            lines.append(f"\n😴 No news: {esc(', '.join(quiet))}")
+        return "\n".join(lines), [[("✏️ Edit portfolio", "cmd:/editportfolio")]]
+
+    def portfolio_edit_view(self, u: User):
         mine, muted = sorted(u.portfolio()), sorted(u.muted())
-        text = (f"⭐ <b>Your portfolio</b> ({len(mine)}): {esc(', '.join(mine)) or 'empty'}\n"
+        text = (f"✏️ <b>Edit portfolio</b> ({len(mine)}): {esc(', '.join(mine)) or 'empty'}\n"
                 f"🔇 Muted: {esc(', '.join(muted)) or 'none'}\n"
                 f"<i>Also watching {len(self.universe)} index stocks and ~{len(self.market_matcher)} companies in the news.</i>")
         rows = [[(f"❌ {s}", f"rm:{s}") for s in mine[i:i + 3]] for i in range(0, len(mine), 3)]
@@ -1144,7 +1253,7 @@ class Radar:
         return text, rows
 
     def more_view(self, u: User):
-        rows = [[("❓ What does each alert mean?", "cmd:/help")]]
+        rows = [[("🩺 Status", "cmd:/status"), ("❓ What does each alert mean?", "cmd:/help")]]
         if u.is_owner:
             rows = [[("👥 Users", "cmd:/users"), ("📡 Channels", "cmd:/channels")],
                     [("🤖 AI status", "cmd:/ai")],
@@ -1172,7 +1281,10 @@ class Radar:
             "📣 Story: several outlets covering a stock\n"
             "🧭 Sector news that affects your stocks\n"
             "🌅 9:06 pre-open gaps · ☀️ 8:30 brief · 📋 digests 12:30, 3:45, 8:30pm\n\n"
-            "Start by tapping ⭐ Portfolio → ➕ Add stocks. "
+            "📊 Every alert about your stock shows its <b>overall</b> verdict from all of today's news, "
+            "so one green or red item never misleads you. 🔄 tells you when that verdict flips.\n"
+            "✅ <b>High certainty</b> lists only the stocks where the evidence clearly points one way.\n\n"
+            "Start by tapping ⭐ Portfolio → ✏️ Edit portfolio → ➕ Add stocks. "
             "Paste any headline as a message and the AI tells you what it means for stocks.")
 
     # ================================================================== commands
@@ -1228,7 +1340,7 @@ class Radar:
                 self.rebuild_matcher()
             else:
                 self.store.mute(rest, False, u.chat)
-            self.tg.edit(mid, *self.portfolio_view(u), chat=u.chat)
+            self.tg.edit(mid, *self.portfolio_edit_view(u), chat=u.chat)
             toast = f"{'Removed' if kind == 'rm' else 'Unmuted'} {rest}"
         elif kind == "add":
             self.store.watch_add(rest, u.chat)
@@ -1295,12 +1407,12 @@ class Radar:
             for a in args:
                 self.store.watch_add(a, u.chat)
             self.rebuild_matcher()
-            u.send(*self.portfolio_view(u))
+            u.send(*self.portfolio_edit_view(u))
         elif cmd in ("/remove", "/unwatch") and args:
             for a in args:
                 self.store.watch_remove(a, u.chat)
             self.rebuild_matcher()
-            u.send(*self.portfolio_view(u))
+            u.send(*self.portfolio_edit_view(u))
         elif cmd == "/mute" and args:
             for a in args:
                 self.store.mute(a, True, u.chat)
@@ -1311,6 +1423,15 @@ class Radar:
             u.send(f"🔊 Unmuted: <b>{esc(', '.join(args))}</b>")
         elif cmd in ("/portfolio", "/list"):
             u.send(*self.portfolio_view(u))
+        elif cmd == "/editportfolio":
+            u.send(*self.portfolio_edit_view(u))
+        elif cmd in ("/sure", "/certain"):
+            lines, rows = self.certainty_view(u)
+            if rows:
+                u.send_long(lines)
+                u.send("Add any of these to your portfolio:", buttons=rows)
+            else:
+                u.send("\n".join(lines))
         elif cmd == "/top":
             c = self.top_candidates(time.time() - 24 * 3600, 8, user=u)
             if not c:

@@ -140,6 +140,24 @@ more to run.
   ☰ More → 👥 Users to see who's using it and 🚫 remove anyone
 - Only the owner can ⬆️ update and 🔑 set the AI key; the AI's daily budget is shared
 
+## 📊 Overall verdict (no more mixed signals)
+
+Every alert about one of your stocks now carries the stock's **overall** verdict
+from all of the last 24 hours' signals, e.g. "📊 Overall (24h): 🔴🔴 Strongly
+negative · 1 positive vs 3 negative · Biggest factor: DGCA grounds 40 aircraft".
+Signals are weighted (filing > results > promoter trade > AI read > deal > news >
+price burst; AI by its confidence), older ones count less (half every 8 h), and
+positives and negatives are netted. If the verdict flips (positive → negative or
+back), you get a 🔄 alert right away. Logic: `radar/outlook.py`.
+
+## ✅ High certainty
+
+One tap shows only the stocks where the evidence clearly points one way: at
+least 75% of the signals agree, the combined weight is large, and either the
+evidence score is 70+ or the AI is 80%+ confident. No count limit; it can be 0
+stocks or 20. Each shows the agreement %, evidence score, AI confidence, today's
+move and the biggest factor, with ⏱️ if it has already moved a lot.
+
 ## 📡 Telegram channels
 
 The owner can add **public** Telegram channels (☰ More → 📡 Channels → ➕ Add
@@ -152,7 +170,8 @@ and groups can't be read this way.
 
 ## Using it: buttons, no typing
 
-- **Button panel** below the typing box: 🎯 Top · 🗞️ Brief · ⭐ Portfolio · 🤖 Ask AI · ⚙️ Settings · 📥 Digest · 📊 Learn · 🩺 Status · ☰ More
+- **Button panel** below the typing box: ✅ High certainty · ⭐ Portfolio · 🗞️ Brief · 🎯 Top · 🤖 Ask AI · 📥 Digest · ⚙️ Settings · 📊 Learn · ☰ More
+- **⭐ Portfolio** shows each stock's overall verdict, busiest first, with quiet stocks on one line; ✏️ Edit portfolio to add or remove
 - **☰ Menu** button next to the typing box lists every function with a short description
 - **Settings** are ➕ / ➖ buttons; **Portfolio** has ❌ buttons to remove and ➕ Add stocks
 - Every ⚡ / 🎯 / 📣 alert has **➕ Add to portfolio** and **🔇 Mute** buttons
