@@ -219,7 +219,73 @@ def search_company_news(session, company: str, symbol: str, days: int = 3, timeo
     r = session.get(url, timeout=timeout)
     r.raise_for_status()
     out = []
-    for it in parse_rss(r.content)[:25]:
+    for it in parse_rss(r.content)[:30]:
         title, src = split_source(it["title"], "Google News")
-        out.append({"title": title, "source": src, "link": it["link"], "ts": rss_time(it["date"])})
+        ts = rss_time(it["date"])
+        if ts is None or is_stale(title, ts, max_age_h=days * 24):
+            continue  # undated, too old, or about an old quarter
+        out.append({"title": title, "source": src, "link": it["link"], "ts": ts})
     return out
+
+
+def reporting_quarters(t=None) -> set:
+    """Indian results seasons (FY runs Apr-Mar). Quarters that can be 'current' news right now:
+    the one being reported this season and the one before it. E.g. in October 2026 that's
+    Q2 FY27 (Jul-Sep, being reported) and Q1 FY27."""
+    from datetime import datetime
+    t = t or datetime.now()
+    fy = t.year + 1 if t.month >= 4 else t.year          # FY27 runs Apr 2026 - Mar 2027
+    m = t.month
+    if m in (1, 2, 3):
+        cur = (3, fy)          # Oct-Dec results come out Jan-Feb
+    elif m in (4, 5, 6):
+        cur = (4, fy - 1)      # Jan-Mar results (and annual) come out Apr-May
+    elif m in (7, 8, 9):
+        cur = (1, fy)
+    else:
+        cur = (2, fy)
+    q, y = cur
+    prev = (q - 1, y) if q > 1 else (4, y - 1)
+    return {cur, prev}
+
+
+_Q = re.compile(r"\bq([1-4])(?!\d)\s*(fy)?\s*['’]?\s*(\d{4}|\d{2}(?!\d))?", re.I)
+_RESULTS_WORDS = re.compile(r"result|earning|profit|revenue|\bpat\b|ebitda|margin|numbers|net (income|loss)", re.I)
+_FY = re.compile(r"\bfy\s*'?(\d{2,4})\b", re.I)
+_YEAR = re.compile(r"\b(20\d{2})\b")
+
+
+def is_stale(headline: str, ts: float = None, now_ts: float = None, max_age_h: float = 72) -> bool:
+    """True for news that is old, even if a feed presents it as new: older than max_age_h,
+    or about a results quarter / financial year that isn't current (e.g. 'Q3 results' in
+    October can only be last year's Q3)."""
+    import time as _t
+    from datetime import datetime
+    now_ts = now_ts or _t.time()
+    if ts and now_ts - ts > max_age_h * 3600:
+        return True
+    t = datetime.fromtimestamp(now_ts)
+    ok = reporting_quarters(t)
+    cur_fy = t.year + 1 if t.month >= 4 else t.year
+    for m in _Q.finditer(headline):
+        q, fy_tag, num = int(m.group(1)), m.group(2), m.group(3)
+        if num:
+            y = int(num)
+            if fy_tag or len(num) == 2:          # "Q3 FY26", "Q3FY26", "Q3'26": financial year
+                y = y + 2000 if y < 100 else y
+                key = (q, y)
+            else:                                 # "Q2 2026": calendar quarter -> financial quarter
+                key = (4, y) if q == 1 else (q - 1, y + 1)
+            if key not in ok:
+                return True
+        elif q not in {qq for qq, _y in ok} and _RESULTS_WORDS.search(headline):
+            return True   # "Q3 results" in October can only be last year's Q3
+    for m in _FY.finditer(headline):
+        y = int(m.group(1))
+        y = y + 2000 if y < 100 else y
+        if y < cur_fy - 1:
+            return True
+    years = [int(y) for y in _YEAR.findall(headline)]
+    if years and max(years) < t.year - (1 if t.month <= 3 else 0):
+        return True
+    return False

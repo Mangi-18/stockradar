@@ -41,10 +41,16 @@ Reply with JSON only:
                "confidence": 0.0, "order": "direct|second-order", "why": "..."}}]}}"""
 
 
-SUMMARY_PROMPT = """You are an Indian equity analyst. Below are the recent news items about {company}
-(NSE: {symbol}), newest first. Weigh ALL of them together: positives against negatives, how
-material each one is for THIS company's earnings and share price, and how recent it is.
-Ignore items that only report a price move that already happened.
+SUMMARY_PROMPT = """You are an Indian equity analyst. Today is {today}. Below are the news items about
+{company} (NSE: {symbol}) from the last 3 days, newest first, each with its publication date.
+Weigh ALL of them together: positives against negatives, how material each one is for THIS
+company's earnings and share price, and how recent it is.
+Rules:
+- Use ONLY the items below. Do not add facts from memory (no past quarters, past results or
+  past events that are not in the list).
+- Ignore any item about an older period (e.g. last year's results) and items that only report
+  a price move that already happened.
+- If nothing below is price-relevant, answer direction "none".
 
 {items}
 
@@ -111,7 +117,9 @@ class AIReader:
         self.last_call = time.time()
         self.calls_today += 1
         lines = "\n".join(f"- {h} ({src})" for _t, h, src in items[:15])
-        prompt = SUMMARY_PROMPT.format(company=company or symbol, symbol=symbol, items=lines)
+        from datetime import datetime, timedelta, timezone
+        today = datetime.now(timezone(timedelta(hours=5, minutes=30))).strftime("%d %b %Y")
+        prompt = SUMMARY_PROMPT.format(company=company or symbol, symbol=symbol, items=lines, today=today)
         try:
             text = self._gemini(prompt) if self.provider == "gemini" else self._groq(prompt)
             m = re.search(r"\{.*\}", text, re.S)

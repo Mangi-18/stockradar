@@ -188,6 +188,21 @@ Rules, fixed in advance:
 🏆 Track record shows the hit rate, average move in the predicted direction, how
 often calls beat the Nifty, results by alert type, every miss, and pending calls.
 
+## Old news filtering
+
+News feeds and Google News sometimes resurface old articles with a new date.
+Every headline is checked by `is_stale()` in `radar/news.py`: anything older than
+48 h (72 h in a stock search), or about a results quarter or financial year that
+isn't current (in October, "Q3 results" can only be last year's), is dropped.
+Result filings for a quarter that ended more than ~140 days ago (late or revised
+filings) are ignored. The AI summary gets each item's date and is told to use
+only the listed items, never facts from memory.
+
+## 🔍 Sure, not owned
+
+Same as ✅ High certainty, but only stocks you don't hold. The High certainty
+screen also has filter buttons: 🌐 All · 🔍 Not in my portfolio · ⭐ Only mine.
+
 ## 📡 Telegram channels
 
 The owner can add **public** Telegram channels (☰ More → 📡 Channels → ➕ Add

@@ -23,7 +23,7 @@ from .channels import Channels, clean_name
 from .classify import HIGH, MEDIUM, classify
 from .outlook import outlook, short
 from .news import (ALIASES, DEFAULT_FEEDS, NewsFeeds, analyse_headline, build_market_matcher,
-                   build_matcher, search_company_news, split_source, tone)
+                   build_matcher, is_stale, rss_time, search_company_news, split_source, tone)
 from .nse import NSE
 from .results import analyse, crore
 from .scoring import score_events
@@ -179,6 +179,10 @@ class Radar:
         if owner:
             self.store.user_add(owner, "owner")
             self.store.migrate_single_user(owner)
+        if not self.store.get("cleanup_old_results_v1"):
+            self.store.db.execute("DELETE FROM events WHERE kind = 'results' AND headline NOT LIKE 'Q results (quarter to%'")
+            self.store.db.commit()
+            self.store.set("cleanup_old_results_v1", "1")
         self.ai = AIReader(self.store.get("ai_key") or config.AI_KEY, config.AI_MAX_PER_DAY)
         self.ai.model = config.AI_MODEL
 
@@ -450,10 +454,17 @@ class Radar:
             self.store.set(key, "done")
             if not a.get("ok"):
                 continue
+            try:
+                q_end = datetime.fromisoformat(a["quarter_end"])
+            except (KeyError, ValueError):
+                continue
+            if (now().replace(tzinfo=None) - q_end).days > 140:
+                log.info("skip old-quarter result %s %s", sym, a["quarter_end"])
+                continue  # a late or revised filing for an old quarter isn't news now
             if a["score"]:
                 self.store.track(sym, "results", a["verdict"], 1 if a["score"] > 0 else -1)
             tone = "+" if a["score"] > 0 else "-" if a["score"] < 0 else "?"
-            self.store.log_event(sym, "results", f"Q results {a['verdict']} ({a['score']:+d}): "
+            self.store.log_event(sym, "results", f"Q results (quarter to {a['quarter_end']}) {a['verdict']} ({a['score']:+d}): "
                                  + "; ".join(a["reasons"]), tone, HIGH if abs(a["score"]) >= 3 else MEDIUM, "NSE")
             self.notify(sym, self.format_result(sym, kind, a), urgent=True)
             self.consider(sym)
@@ -660,6 +671,8 @@ class Radar:
                 title, src = it["title"], host
                 if "news.google." in host:
                     title, src = split_source(title, host)
+                if is_stale(title, rss_time(it.get("date", "")), max_age_h=48):
+                    continue  # old article resurfacing in a feed, or about an old results quarter
                 if not self.store.first_time("news:" + re.sub(r"\W+", "", title.lower())[:120]) or first:
                     continue
                 self.handle_headline(title, src, it["link"])
@@ -1330,15 +1343,16 @@ class Radar:
 
     # ================================================================== buttons & menu
     MENU = [("menu", "Show the button panel"), ("sure", "Only the stocks where the evidence clearly points one way"),
+            ("new", "High-certainty stocks you don't own yet"),
             ("portfolio", "Your stocks with their overall verdict"),
             ("track", "How many predictions were right and wrong, honestly"),
             ("top", "Strongest candidates right now"), ("brief", "News summary (pick hours)"),
             ("digest", "Get held-back items now"), ("ask", "Ask the AI about any headline"),
             ("settings", "Change your limits with ➕ / ➖ buttons"), ("learn", "How past signals played out"),
             ("status", "Health check")]
-    PANEL = [["✅ High certainty", "⭐ Portfolio", "🗞️ Brief"], ["🎯 Top", "🤖 Ask AI", "📥 Digest"],
+    PANEL = [["✅ High certainty", "🔍 Sure, not owned", "⭐ Portfolio"], ["🗞️ Brief", "🤖 Ask AI", "📥 Digest"],
              ["⚙️ Settings", "🏆 Track record", "☰ More"]]
-    PANEL_MAP = {"🏆 Track record": "/track", "✅ High certainty": "/sure", "🎯 Top": "/top", "🗞️ Brief": "/brief", "⭐ Portfolio": "/portfolio", "🤖 Ask AI": "/ask",
+    PANEL_MAP = {"🏆 Track record": "/track", "✅ High certainty": "/sure", "🔍 Sure, not owned": "/new", "🎯 Top": "/top", "🗞️ Brief": "/brief", "⭐ Portfolio": "/portfolio", "🤖 Ask AI": "/ask",
                  "⚙️ Settings": "/settings", "📥 Digest": "/digest", "📊 Learn": "/learn",
                  "🩺 Status": "/status", "☰ More": "/more"}
     STEPS = {  # setting -> (button label, step, min, max)
@@ -1390,7 +1404,7 @@ class Radar:
         """Everything we know about one stock: overall verdict (positives AND negatives),
         AI's net reading, price today, and the latest news with each item's tone."""
         company = self.names.get(sym, "") or sym
-        stored = self.store.events_for(sym, 72)
+        stored = [e for e in self.store.events_for(sym, 72) if not is_stale(e["headline"], e["ts"])]
         # Fresh headlines from Google News (cached 20 min), so even stocks nobody tracks have news
         cached = self._report_cache.get(sym)
         if cached and time.time() - cached[0] < 1200:
@@ -1417,7 +1431,8 @@ class Radar:
         o = outlook([e for e in events if time.time() - e["ts"] <= 24 * 3600])
         o3 = outlook(events)
         if summary is None and self.ai.provider and events:
-            items = [(e["tone"], short(e, 160), e["source"]) for e in reversed(events)
+            items = [(e["tone"], f"[{datetime.fromtimestamp(e['ts'], IST).strftime('%d %b %Y %H:%M')}] {short(e, 160)}",
+                      e["source"]) for e in reversed(events)
                      if e["kind"] in ("news", "filing", "results", "insider", "deal", "ai", "tgnews")]
             summary = self.ai.summarize(sym, company, items)
         self._report_cache[sym] = (time.time(), fetched, summary)
@@ -1493,14 +1508,25 @@ class Radar:
             out.append({"symbol": s, "o": o, "score": sc["score"], "very": very})
         return sorted(out, key=lambda x: (not x["very"], -abs(x["o"]["net"])))
 
-    def certainty_view(self, u: User):
-        items = self.high_certainty(u)
+    SCOPES = {"all": "all stocks", "others": "stocks you don't own", "mine": "your portfolio"}
+
+    def scope_buttons(self, scope: str):
+        names = {"all": "🌐 All", "others": "🔍 Not in my portfolio", "mine": "⭐ Only mine"}
+        return [[(("• " if k == scope else "") + v, f"sure:{k}") for k, v in names.items()]]
+
+    def certainty_view(self, u: User, scope: str = "all"):
         mine = u.portfolio()
+        items = self.high_certainty(u)
+        if scope == "others":
+            items = [it for it in items if it["symbol"] not in mine]
+        elif scope == "mine":
+            items = [it for it in items if it["symbol"] in mine]
+        where = self.SCOPES.get(scope, "all stocks")
         if not items:
-            return (["✅ <b>High certainty</b>",
+            return ([f"✅ <b>High certainty · {where}</b>",
                      "Nothing right now. A stock appears here only when most of the last 24h's signals point "
-                     "the same way and the evidence is strong."], [])
-        lines = [f"✅ <b>High certainty</b> · {len(items)} stock{'s' if len(items) != 1 else ''} (last 24h)",
+                     "the same way and the evidence is strong."], self.scope_buttons(scope))
+        lines = [f"✅ <b>High certainty · {where}</b> · {len(items)} stock{'s' if len(items) != 1 else ''} (last 24h)",
                  "<i>Most signals agree and the evidence is strong. Strong evidence, not a guarantee. "
                  "📌 Every call here is recorded and judged at the next close → 🏆 Track record.</i>"]
         for it in items:
@@ -1519,7 +1545,17 @@ class Radar:
             if moved:
                 lines.append("   ⏱️ Already moved a lot today; may be late.")
         add = [it["symbol"] for it in items if it["symbol"] not in mine][:6]
-        return lines, [[(f"➕ {s}", f"add:{s}") for s in add[i:i + 3]] for i in range(0, len(add), 3)]
+        rows = [[(f"➕ {s}", f"add:{s}") for s in add[i:i + 3]] for i in range(0, len(add), 3)]
+        return lines, rows + self.scope_buttons(scope)
+
+    def send_certainty(self, u: User, scope: str) -> None:
+        lines, rows = self.certainty_view(u, scope)
+        text = "\n".join(lines)
+        if len(text) > 3800:
+            u.send_long(lines)
+            u.send("Filter or add:", buttons=rows)
+        else:
+            u.send(text, buttons=rows)
 
     def portfolio_view(self, u: User):
         """Your stocks ranked by how much is going on, with each one's overall verdict.
@@ -1554,7 +1590,8 @@ class Radar:
         return text, rows
 
     def more_view(self, u: User):
-        rows = [[("🩺 Status", "cmd:/status"), ("❓ What does each alert mean?", "cmd:/help")]]
+        rows = [[("🎯 Top candidates", "cmd:/top"), ("🩺 Status", "cmd:/status")],
+                [("❓ What does each alert mean?", "cmd:/help")]]
         if u.is_owner:
             rows = [[("👥 Users", "cmd:/users"), ("📡 Channels", "cmd:/channels")],
                     [("🤖 AI status", "cmd:/ai")],
@@ -1651,6 +1688,8 @@ class Radar:
         elif kind == "mute":
             self.store.mute(rest, True, u.chat)
             toast = f"🔇 {rest} muted"
+        elif kind == "sure":
+            self.send_certainty(u, rest)
         elif kind == "stock":
             self.send_stock(u, rest, refresh=True)
         elif kind == "rmq":
@@ -1749,13 +1788,8 @@ class Radar:
             u.send(*self.portfolio_view(u))
         elif cmd == "/editportfolio":
             u.send(*self.portfolio_edit_view(u))
-        elif cmd in ("/sure", "/certain"):
-            lines, rows = self.certainty_view(u)
-            if rows:
-                u.send_long(lines)
-                u.send("Add any of these to your portfolio:", buttons=rows)
-            else:
-                u.send("\n".join(lines))
+        elif cmd in ("/sure", "/certain", "/new"):
+            self.send_certainty(u, "others" if cmd == "/new" else "all")
         elif cmd == "/top":
             c = self.top_candidates(time.time() - 24 * 3600, 8, user=u)
             if not c:
@@ -1893,7 +1927,8 @@ class Radar:
             self.store.set("panel_id", panel_id)
             for u in self.users():
                 if not u.is_owner:
-                    u.send("🆕 New buttons: ✅ High certainty, and ⭐ Portfolio now shows each stock's overall verdict.",
+                    u.send("🆕 New buttons: 🔍 Sure, not owned (high-certainty stocks you don't hold), "
+                           "🏆 Track record, and ✅ High certainty. 🎯 Top is now under ☰ More.",
                            reply_keyboard=self.PANEL)
         self.owner.send(f"🛰️ Stock Radar online · {n} {'person' if n == 1 else 'people'} using it · "
                         f"your portfolio: {len(self.owner.portfolio())} stocks.", reply_keyboard=self.PANEL)

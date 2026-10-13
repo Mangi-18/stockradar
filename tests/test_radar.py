@@ -781,6 +781,61 @@ def test_holiday_does_not_judge():
     assert r.store.predictions()[0]["result"] is None
 
 
+# ---------------------------------------------------------------- stale news + scoped certainty
+def test_old_news_is_dropped_from_stock_search():
+    import time
+    from radar.news import is_stale
+    assert is_stale("Happiest Minds Q3 results: net profit rises 12%")  or M.now().month in (1, 2, 3, 4)
+    r = make_radar()
+    r.names["HAPPSTMNDS"] = "Happiest Minds Technologies Limited"
+    seen_items = []
+    def fake_search(session, company, sym, days=3, timeout=8):
+        return [{"title": "Happiest Minds wins large AI deal from US bank", "source": "ET", "link": "", "ts": time.time() - 3600}]
+    M.search_company_news = fake_search
+    r.ai.key = "AQ.test"
+    def fake_sum(sym, co, items):
+        seen_items.extend(items)
+        return {"direction": "up", "confidence": 0.6, "positives": ["new deal"], "negatives": [], "summary": "Deal win."}
+    r.ai.summarize = fake_sum
+    r.store.log_event("HAPPSTMNDS", "news", "Happiest Minds Q3FY26 results: profit up 12%", "+", "HIGH", "Mint")
+    lines, _ = r.stock_report(r.owner, "HAPPSTMNDS")
+    text = "\n".join(lines)
+    assert "Q3FY26" not in text and "AI deal" in text, text
+    assert seen_items and seen_items[0][1].startswith("[")          # AI gets dated items
+
+
+def test_old_quarter_results_filing_is_ignored():
+    r = make_radar(["HAPPSTMNDS"])
+    r.warmed_up.add("results")
+    class N:
+        def financial_results(self):
+            return [{"symbol": "HAPPSTMNDS", "xbrl": "https://x/y.xml", "consolidated": "Consolidated",
+                     "toDate": "31-Dec-2025"}]
+        def fetch_bytes(self, url):
+            # the same filing, one year older: quarter ending 30 Sep 2025
+            return XBRL.replace(b"2026-", b"2025-X").replace(b"2025-0", b"2024-0").replace(b"2025-X", b"2025-")
+    from radar.results import analyse
+    assert analyse(N().fetch_bytes(""))["quarter_end"] == "2025-09-30"
+    r.nse = N()
+    r.poll_results()
+    assert not any("Q results" in m for m in r.sent)
+    assert not r.store.events_for("HAPPSTMNDS", 24)
+
+
+def test_certainty_scope_not_owned():
+    r = make_radar(["ZENTEC"])
+    for sym in ("ZENTEC", "GPIL"):
+        for src in ("ET", "Mint", "BS"):
+            r.store.log_event(sym, "news", f"{sym} bags big order", "+", "HIGH", src)
+        r.store.log_event(sym, "filing", "Order win: Rs 1,200 cr order", "+", "HIGH", "NSE")
+        r.store.log_event(sym, "ai", "AI: ↑ large (88%) — order is 40% of revenue [x]", "+", "HIGH", "NSE")
+    lines, rows = r.certainty_view(r.owner, "others")
+    text = "\n".join(lines)
+    assert "GPIL" in text and "ZENTEC" not in text and "don't own" in text
+    lines, rows = r.certainty_view(r.owner, "mine")
+    assert "ZENTEC" in "\n".join(lines) and "GPIL" not in "\n".join(lines)
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
