@@ -24,6 +24,7 @@ from .classify import HIGH, MEDIUM, classify
 from .outlook import outlook, short
 from .news import (ALIASES, DEFAULT_FEEDS, NewsFeeds, analyse_headline, build_market_matcher,
                    build_matcher, is_stale, rss_time, search_company_news, split_source, tone)
+from .market import Yahoo, returns
 from .nse import NSE
 from .results import analyse, crore
 from .scoring import score_events
@@ -160,7 +161,11 @@ class Radar:
         self._ai_cycle = 0
         self._ai_filing_cycle = 0
         self._story_ai = {}
-        self._report_cache = {}      # symbol -> (time, fetched headlines, AI summary)          # (day, symbol) -> AI reading used for 📣 story alerts
+        self._report_cache = {}      # symbol -> (time, AI analysis)
+        self._news_cache = {}        # symbol -> (time, Google News headlines)
+        self._ctx_cache = {}         # symbol -> (time, price/sector/peers/news context)
+        self._rows, self._rows_at, self._rows_fail_at = {}, 0.0, 0.0   # NSE rows used for peer ranking
+        self.yahoo = Yahoo()
         self.awaiting = {}           # chat -> what their next typed message means
         self.result_tries = {}
         self.warmed_up = set()
@@ -1400,25 +1405,143 @@ class Radar:
         starts.sort(key=lambda s: (len(self.names.get(s, "")), s))
         return (starts + sorted(contains))[:8]
 
-    def stock_report(self, u: User, sym: str):
-        """Everything we know about one stock: overall verdict (positives AND negatives),
-        AI's net reading, price today, and the latest news with each item's tone."""
-        company = self.names.get(sym, "") or sym
-        stored = [e for e in self.store.events_for(sym, 72) if not is_stale(e["headline"], e["ts"])]
-        # Fresh headlines from Google News (cached 20 min), so even stocks nobody tracks have news
-        cached = self._report_cache.get(sym)
-        if cached and time.time() - cached[0] < 1200:
-            fetched, summary = cached[1], cached[2]
-        else:
-            fetched, summary = [], None
+    # --- price, sector and peers -------------------------------------------------
+    PEER_INDEX = "NIFTY TOTAL MARKET"   # ~750 stocks with NSE's industry tag: big enough to find peers
+
+    def market_rows(self) -> dict:
+        """symbol -> NSE quote row (with meta.industry, ffmc, 30-day and 1-year change), refreshed every 15 min."""
+        if self._rows and time.time() - self._rows_at < 900:
+            return self._rows
+        if time.time() - self._rows_fail_at < 600:
+            return self._rows
+        try:
+            rows, _ = self.nse.index_stocks(self.PEER_INDEX)
+            if rows:
+                self._rows, self._rows_at = {r["symbol"]: r for r in rows}, time.time()
+        except Exception as e:
+            log.warning("peer rows: %s", e)
+            self._rows_fail_at = time.time()
+        return self._rows
+
+    @staticmethod
+    def _f(x):
+        try:
+            return float(x)
+        except (TypeError, ValueError):
+            return None
+
+    def price_info(self, sym: str) -> dict:
+        """{'price','today','1w','1m','1y','high52','low52','pe','sector_pe','sector','industry'}:
+        NSE first, Yahoo Finance for whatever NSE couldn't give (NSE often blocks cloud servers)."""
+        out = {}
+        row = self.market_rows().get(sym)
+        if row:
+            out.update(price=self._f(row.get("lastPrice")), today=self._f(row.get("pChange")),
+                       **{"1m": self._f(row.get("perChange30d")), "1y": self._f(row.get("perChange365d"))},
+                       high52=self._f(row.get("yearHigh")), low52=self._f(row.get("yearLow")),
+                       industry=(row.get("meta") or {}).get("industry", ""))
+        try:
+            q = self.nse.quote(sym)
+            for k, v in (("price", q.get("lastPrice")), ("today", q.get("pChange")), ("high52", q.get("yearHigh")),
+                         ("low52", q.get("yearLow")), ("pe", q.get("pe")), ("sector_pe", q.get("sector_pe"))):
+                if out.get(k) is None and self._f(v) is not None:
+                    out[k] = self._f(v)
+            for k in ("sector", "industry"):
+                if not out.get(k) and q.get(k):
+                    out[k] = q[k]
+        except Exception as e:
+            log.info("nse quote %s: %s", sym, e)
+        try:
+            r = returns(self.yahoo.history(sym))
+            for k in ("today", "1w", "1m", "1y", "high52", "low52"):
+                if out.get(k) is None and r.get(k) is not None:
+                    out[k] = r[k]
+            if out.get("price") is None:
+                out["price"] = self.yahoo.history(sym)["price"]
+        except Exception as e:
+            log.info("yahoo history %s: %s", sym, e)
+        if not out.get("sector"):
             try:
-                fetched = search_company_news(self.news.s, re.sub(r"\s+(limited|ltd\.?)$", "", company, flags=re.I), sym)
+                pr = self.yahoo.profile(sym)
+                out["sector"] = pr.get("sector", "")
+                out.setdefault("industry", pr.get("industry", ""))
+                if not out.get("industry"):
+                    out["industry"] = pr.get("industry", "")
+            except Exception as e:
+                log.info("yahoo profile %s: %s", sym, e)
+        if out.get("today") is None and sym in self.day_change:
+            out["today"], out["price"] = self.day_change[sym], out.get("price") or self.last_price.get(sym)
+        return out
+
+    def nifty_today(self):
+        for name in ("NIFTY 50", self.PEER_INDEX, "NIFTY MIDCAP 100"):
+            ic = getattr(self.nse, "index_change", {})
+            if name in ic:
+                return ic[name]
+        try:
+            return returns(self.yahoo.history("NIFTY", "^NSEI")).get("today")
+        except Exception:
+            return None
+
+    def peer_info(self, sym: str, info: dict) -> dict:
+        """Same-industry companies and where this stock ranks among them.
+        {'source','peers':[{symbol,name,size,today,1m,1y}], 'rank':{metric:(pos,total,value,avg)}}"""
+        rows = self.market_rows()
+        ind = (info.get("industry") or "").strip().lower()
+        peers, source = [], ""
+        if rows and ind:
+            for s, r in rows.items():
+                if ((r.get("meta") or {}).get("industry") or "").strip().lower() == ind:
+                    peers.append({"symbol": s, "name": (r.get("meta") or {}).get("companyName") or self.names.get(s, ""),
+                                  "size": self._f(r.get("ffmc")), "today": self._f(r.get("pChange")),
+                                  "1m": self._f(r.get("perChange30d")), "1y": self._f(r.get("perChange365d"))})
+            source = "NSE"
+        if len(peers) < 2:  # NSE unavailable or industry not matched: Yahoo's list of comparable companies
+            peers, source = [], ""
+            try:
+                for s in [sym] + [x for x in self.yahoo.similar(sym) if x != sym][:6]:
+                    r = returns(self.yahoo.history(s))
+                    peers.append({"symbol": s, "name": self.names.get(s, ""), "size": None,
+                                  "today": r.get("today"), "1m": r.get("1m"), "1y": r.get("1y")})
+                source = "Yahoo"
+            except Exception as e:
+                log.info("yahoo peers %s: %s", sym, e)
+        if not any(p["symbol"] == sym for p in peers):
+            if not peers:
+                return {"source": "", "peers": [], "rank": {}}
+            peers.append({"symbol": sym, "name": self.names.get(sym, ""), "size": None,
+                          "today": info.get("today"), "1m": info.get("1m"), "1y": info.get("1y")})
+        rank = {}
+        for m in ("size", "today", "1m", "1y"):
+            have = [p for p in peers if p[m] is not None]
+            me = next((p for p in have if p["symbol"] == sym), None)
+            if len(have) < 2 or not me:
+                continue
+            have.sort(key=lambda p: -p[m])
+            others = [p[m] for p in have if p["symbol"] != sym]
+            rank[m] = (have.index(me) + 1, len(have), me[m], sum(others) / len(others))
+        peers.sort(key=lambda p: -(p["size"] or 0))
+        return {"source": source, "peers": peers, "rank": rank}
+
+    def stock_events(self, sym: str, hours: float = 168) -> list:
+        """Stored events + fresh Google News headlines (cached 20 min), stale/old-period items dropped."""
+        company = self.names.get(sym, "") or sym
+        stored = [e for e in self.store.events_for(sym, hours) if not is_stale(e["headline"], e["ts"])]
+        cached = self._news_cache.get(sym)
+        if cached and time.time() - cached[0] < 1200:
+            fetched = cached[1]
+        else:
+            fetched = []
+            try:
+                fetched = search_company_news(self.news.s, company, sym, days=7,
+                                              aliases=[a for a in ALIASES.get(sym, ()) if len(a) > 3][:2])
             except Exception as e:
                 log.warning("news search %s: %s", sym, e)
+            self._news_cache[sym] = (time.time(), fetched)
         known = {e["headline"][:80].lower() for e in stored}
         events = list(stored)
         for f in fetched:
-            if f["title"][:80].lower() in known or not f["ts"] or time.time() - f["ts"] > 72 * 3600:
+            if f["title"][:80].lower() in known or not f["ts"] or time.time() - f["ts"] > hours * 3600:
                 continue
             c = classify(f["title"])
             t = tone(f["title"])
@@ -1428,43 +1551,131 @@ class Radar:
                            "source": f["source"], "url": f["link"]})
             known.add(f["title"][:80].lower())
         events.sort(key=lambda e: e["ts"])
-        o = outlook([e for e in events if time.time() - e["ts"] <= 24 * 3600])
-        o3 = outlook(events)
-        if summary is None and self.ai.provider and events:
-            items = [(e["tone"], f"[{datetime.fromtimestamp(e['ts'], IST).strftime('%d %b %Y %H:%M')}] {short(e, 160)}",
-                      e["source"]) for e in reversed(events)
-                     if e["kind"] in ("news", "filing", "results", "insider", "deal", "ai", "tgnews")]
-            summary = self.ai.summarize(sym, company, items)
-        self._report_cache[sym] = (time.time(), fetched, summary)
+        return events
 
-        dc = self.day_change.get(sym)
-        price = self.last_price.get(sym)
-        if dc is None:
-            try:
-                q = self.nse.quote(sym)
-                dc, price = float(q["pChange"]), float(q["lastPrice"])
-            except Exception:
-                pass
+    def stock_context(self, sym: str) -> dict:
+        cached = self._ctx_cache.get(sym)
+        if cached and time.time() - cached[0] < 600:
+            return cached[1]
+        info = self.price_info(sym)
+        ctx = {"sym": sym, "company": self.names.get(sym, "") or sym, "info": info,
+               "nifty": self.nifty_today(), "peers": self.peer_info(sym, info), "events": self.stock_events(sym)}
+        self._ctx_cache[sym] = (time.time(), ctx)
+        return ctx
+
+    @staticmethod
+    def _pct(x, digits=1):
+        return "n/a" if x is None else f"{x:+.{digits}f}%"
+
+    def facts_text(self, ctx: dict, news_hours: float = 168) -> str:
+        """Plain-text facts handed to the AI (it is told to use nothing else)."""
+        i, pr = ctx["info"], ctx["peers"]
+        f = []
+        if i.get("price"):
+            f.append(f"Price: Rs {i['price']:,.2f}. Change today: {self._pct(i.get('today'), 2)}. "
+                     f"Nifty 50 today: {self._pct(ctx['nifty'], 2)}.")
+        f.append(f"Returns: 1 week {self._pct(i.get('1w'))}, 1 month {self._pct(i.get('1m'))}, 1 year {self._pct(i.get('1y'))}."
+                 + (f" 52-week range Rs {i['low52']:,.0f} to Rs {i['high52']:,.0f}." if i.get("low52") and i.get("high52") else ""))
+        if i.get("sector") or i.get("industry"):
+            f.append(f"Sector: {i.get('sector') or 'n/a'}; industry: {i.get('industry') or 'n/a'}.")
+        if i.get("pe") and i.get("sector_pe"):
+            f.append(f"P/E {i['pe']:.1f} vs sector P/E {i['sector_pe']:.1f}.")
+        names = {"size": "size (free-float market cap)", "today": "today's move", "1m": "1-month return", "1y": "1-year return"}
+        for m, (pos, tot, val, avg) in pr["rank"].items():
+            f.append(f"Rank among {tot} industry peers by {names[m]}: #{pos}"
+                     + ("" if m == "size" else f" ({val:+.1f}% vs peer average {avg:+.1f}%)") + ".")
+        if pr["peers"]:
+            f.append("Peers: " + "; ".join(
+                f"{p['symbol']} today {self._pct(p['today'])}, 1m {self._pct(p['1m'])}"
+                for p in pr["peers"][:8] if p["symbol"] != ctx["sym"]) + ".")
+        ev = [e for e in reversed(ctx["events"]) if time.time() - e["ts"] <= news_hours * 3600][:15]
+        if ev:
+            f.append("News (newest first):")
+            for e in ev:
+                when = datetime.fromtimestamp(e["ts"], IST).strftime("%d %b %Y %H:%M")
+                f.append(f"- [{when}] {short(e, 180)} ({e['source'] or e['kind']})")
+        else:
+            f.append("News: no news items found for this stock in this period.")
+        return "\n".join(f)
+
+    def peer_lines(self, ctx: dict) -> list:
+        i, pr = ctx["info"], ctx["peers"]
+        out = []
+        sec = " · ".join(x for x in (i.get("sector"), i.get("industry")) if x)
+        out.append(f"🏭 <b>Sector:</b> {esc(sec) if sec else 'not available'}")
+        if pr["rank"]:
+            label = {"size": "Size", "today": "Today", "1m": "1 month", "1y": "1 year"}
+            tot = max(t for _p, t, _v, _a in pr["rank"].values())
+            out.append(f"🏁 <b>Rank vs {tot - 1} peers</b> (1 = best)")
+            for m, (pos, n, val, avg) in pr["rank"].items():
+                medal = "🥇" if pos == 1 else ("🔻" if pos == n else "▫️")
+                out.append(f"   {medal} {label[m]}: <b>#{pos} of {n}</b>"
+                           + ("" if m == "size" else f" · {val:+.1f}% vs peers {avg:+.1f}%"))
+            if i.get("pe") and i.get("sector_pe"):
+                cheap = "cheaper" if i["pe"] < i["sector_pe"] else "pricier"
+                out.append(f"   ▫️ P/E {i['pe']:.1f} vs sector {i['sector_pe']:.1f} ({cheap} than sector)")
+            top = [p for p in pr["peers"] if p["symbol"] != ctx["sym"]][:5]
+            if top:
+                out.append("   Peers: " + " · ".join(f"{p['symbol']} {self._pct(p['today'])}" for p in top))
+        else:
+            out.append("🏁 Peer ranking not available right now (market data sources unreachable).")
+        return out
+
+    def stock_report(self, u: User, sym: str):
+        """Everything about one stock: price and returns, sector and rank vs peers, the net news verdict
+        (positives AND negatives), an AI analysis (always shown), and the latest news."""
+        ctx = self.stock_context(sym)
+        info, events, company = ctx["info"], ctx["events"], ctx["company"]
+        cached = self._report_cache.get(sym)
+        if cached and time.time() - cached[0] < 1200:
+            analysis = cached[1]
+        else:
+            analysis = self.ai.analyse(sym, company, self.facts_text(ctx)) if self.ai.provider else None
+            if analysis:
+                self._report_cache[sym] = (time.time(), analysis)
+
         star = "⭐ " if sym in u.portfolio() else ""
-        lines = [f"🔎 {star}<b>{esc(sym)}</b> · {esc(company)}"
-                 + (f"\nPrice ₹{price:,.2f} · today {dc:+.2f}%" if price is not None and dc is not None else "")]
+        lines = [f"🔎 {star}<b>{esc(sym)}</b> · {esc(company)}"]
+        if info.get("price"):
+            lines.append(f"💰 ₹{info['price']:,.2f} · today <b>{self._pct(info.get('today'), 2)}</b>"
+                         + (f" (Nifty {self._pct(ctx['nifty'], 2)})" if ctx["nifty"] is not None else ""))
+            rets = [f"{k} {self._pct(info.get(k))}" for k in ("1w", "1m", "1y") if info.get(k) is not None]
+            if rets:
+                lines.append("   " + " · ".join(rets)
+                             + (f" · 52w ₹{info['low52']:,.0f}–{info['high52']:,.0f}" if info.get("low52") and info.get("high52") else ""))
+        else:
+            lines.append("💰 Price not available right now.")
+        lines += self.peer_lines(ctx)
+
+        o = outlook([e for e in events if time.time() - e["ts"] <= 24 * 3600])
+        o7 = outlook(events)
+        lines.append("")
         if o["label"]:
-            lines.append(f"📊 <b>Overall (24h): {o['label']}</b> · {o['pos']} positive vs {o['neg']} negative")
-        if o3["label"] and o3["label"] != o["label"]:
-            lines.append(f"📊 3-day view: {o3['label']} · {o3['pos']} positive vs {o3['neg']} negative")
-        if not o["label"] and not o3["label"]:
-            lines.append("📊 No price-relevant news in the last 3 days.")
-        if summary and summary["direction"] in ("up", "down", "mixed"):
-            arrow = {"up": "🟢 ↑ net positive", "down": "🔴 ↓ net negative", "mixed": "🟡 mixed"}[summary["direction"]]
-            lines.append(f"\n🤖 <b>AI's net reading:</b> {arrow} ({summary['confidence']:.0%} confident)")
-            if summary["summary"]:
-                lines.append(f"   {esc(summary['summary'])}")
-            for p in summary["positives"][:3]:
+            lines.append(f"📊 <b>News verdict (24h): {o['label']}</b> · {o['pos']} positive vs {o['neg']} negative")
+        if o7["label"] and o7["label"] != o["label"]:
+            lines.append(f"📊 News verdict (7 days): {o7['label']} · {o7['pos']} positive vs {o7['neg']} negative")
+        if not o["label"] and not o7["label"]:
+            lines.append("📊 No price-relevant news in the last 7 days.")
+
+        if analysis:
+            arrow = {"up": "🟢 ↑ leans positive", "down": "🔴 ↓ leans negative",
+                     "mixed": "🟡 mixed"}.get(analysis["direction"], "⚪ no clear direction")
+            lines.append(f"\n🤖 <b>AI analysis:</b> {arrow} ({analysis['confidence']:.0%} confident)")
+            if analysis["summary"]:
+                lines.append(f"   {esc(analysis['summary'])}")
+            if analysis["vs_peers"]:
+                lines.append(f"   🏁 {esc(analysis['vs_peers'])}")
+            for p in analysis["positives"][:3]:
                 lines.append(f"   ➕ {esc(p)}")
-            for n in summary["negatives"][:3]:
+            for n in analysis["negatives"][:3]:
                 lines.append(f"   ➖ {esc(n)}")
+        elif not self.ai.provider:
+            lines.append("\n🤖 AI analysis is off: the owner can add a free AI key (☰ More → 🔑 AI key).")
+        else:
+            lines.append(f"\n🤖 AI analysis unavailable right now ({'daily limit reached' if not self.ai.budget_left() else 'AI call failed'}). Tap 🔄 Refresh to retry.")
+
         if events:
-            lines.append("\n<b>Latest news</b>")
+            lines.append(f"\n<b>Latest news</b> ({len(events)} in 7 days)")
             for e in list(reversed(events))[:10]:
                 when = datetime.fromtimestamp(e["ts"], IST).strftime("%d %b %H:%M")
                 link = f' <a href="{esc(e["url"])}">↗</a>' if e.get("url") else ""
@@ -1472,19 +1683,90 @@ class Radar:
         lines.append("<i>Verdict combines all items, weighted by importance and recency. Not a guarantee.</i>")
         held = sym in u.portfolio()
         buttons = [[("❌ Remove from portfolio" if held else f"➕ Add {sym} to portfolio", f"rmq:{sym}" if held else f"add:{sym}"),
-                    ("🔄 Refresh", f"stock:{sym}")]]
+                    ("🔄 Refresh", f"stockr:{sym}")],
+                   [("📉 Why is it falling?", f"move:{sym}:down"), ("📈 Why is it rising?", f"move:{sym}:up")]]
         return lines, buttons
 
     def send_stock(self, u: User, sym: str, refresh: bool = False) -> None:
         if refresh:
-            self._report_cache.pop(sym, None)
+            for c in (self._report_cache, self._ctx_cache, self._news_cache):
+                c.pop(sym, None)
+        self.tg.typing(u.chat)
         lines, buttons = self.stock_report(u, sym)
+        self._send_lines(u, lines, buttons)
+
+    def _send_lines(self, u: User, lines: list, buttons) -> None:
         text = "\n".join(lines)
         if len(text) > 3900:
             u.send_long(lines)
             u.send("⬆️", buttons=buttons)
         else:
             u.send(text, buttons=buttons)
+
+    # --- "<stock> fall" / "<stock> rise": why did it move? -------------------------
+    DOWN_WORDS = {"fall", "falls", "fell", "falling", "fallen", "down", "drop", "drops", "dropped", "dropping",
+                  "crash", "crashed", "crashing", "decline", "declined", "declining", "red", "sink", "sinking", "sank",
+                  "slump", "slumped", "tank", "tanked", "tanking", "plunge", "plunged", "dip", "dipped", "falling?"}
+    UP_WORDS = {"rise", "rises", "rose", "rising", "risen", "up", "jump", "jumps", "jumped", "jumping", "rally",
+                "rallied", "rallying", "gain", "gained", "gaining", "surge", "surged", "surging", "green", "soar",
+                "soared", "soaring", "spike", "spiked", "climb", "climbed", "climbing", "zoom", "zoomed"}
+    FILLER = {"why", "is", "did", "does", "has", "have", "today", "so", "much", "the", "stock", "share", "shares",
+              "price", "what", "reason", "for", "behind", "it", "its", "was", "are", "going", "gone", "this", "week",
+              "explain", "tell", "me", "about", "in", "of", "a"}
+
+    def parse_move(self, text: str):
+        """'indigo fall', 'why did tcs rise today', 'HAL up' -> ('indigo', 'down') etc., else None."""
+        words = re.sub(r"[^a-z0-9& ]", " ", text.lower()).split()
+        if not 2 <= len(words) <= 8:
+            return None
+        dirs = {"down" for w in words if w in self.DOWN_WORDS} | {"up" for w in words if w in self.UP_WORDS}
+        if len(dirs) != 1:
+            return None
+        rest = [w for w in words if w not in self.DOWN_WORDS | self.UP_WORDS | self.FILLER]
+        if not rest or len(rest) > 4:
+            return None
+        return " ".join(rest), dirs.pop()
+
+    def explain_move(self, u: User, sym: str, direction: str) -> None:
+        self.tg.typing(u.chat)
+        ctx = self.stock_context(sym)
+        info, company = ctx["info"], ctx["company"]
+        pr = ctx["peers"]
+        word = "fall" if direction == "down" else "rise"
+        icon = "📉" if direction == "down" else "📈"
+        lines = [f"{icon} <b>Why did {esc(sym)} {word}?</b> · {esc(company)}"]
+        facts = [f"Today {self._pct(info.get('today'), 2)}"]
+        for k in ("1w", "1m"):
+            if info.get(k) is not None:
+                facts.append(f"{k} {self._pct(info[k])}")
+        if ctx["nifty"] is not None:
+            facts.append(f"Nifty today {self._pct(ctx['nifty'], 2)}")
+        if "today" in pr["rank"]:
+            facts.append(f"peers today {pr['rank']['today'][3]:+.1f}% avg")
+        lines.append("📏 " + " · ".join(facts))
+        r = self.ai.explain_move(sym, company, "fell" if direction == "down" else "rose",
+                                 self.facts_text(ctx, news_hours=96)) if self.ai.provider else None
+        if r:
+            if r["actual_move"] in ("up", "down", "flat") and not r["matches_user"]:
+                lines.append(f"⚠️ <b>Note:</b> the data shows it actually went <b>{r['actual_move']}</b>, not {word}.")
+            lines.append(f"\n🤖 <b>{esc(r['headline'])}</b>")
+            tag = {"company": "🏢 Company", "sector": "🏭 Sector", "market": "🌐 Market"}
+            for x in r["reasons"]:
+                lines.append(f"{tag.get(x['type'], '❔ Unclear')}: {esc(x['reason'])}"
+                             + (f"\n      <i>↳ {esc(x['evidence'])}</i>" if x["evidence"] else ""))
+            lines.append(f"<i>AI confidence {r['confidence']:.0%}. Based only on the price data and news listed in the report.</i>")
+        elif not self.ai.provider:
+            lines.append("🤖 AI is off: the owner can add a free AI key (☰ More → 🔑 AI key).")
+        else:
+            lines.append("🤖 AI explanation unavailable right now (daily limit or AI error). Recent news below.")
+        ev = [e for e in reversed(ctx["events"]) if time.time() - e["ts"] <= 96 * 3600][:5]
+        if ev:
+            lines.append("\n<b>Recent news</b>")
+            for e in ev:
+                when = datetime.fromtimestamp(e["ts"], IST).strftime("%d %b %H:%M")
+                link = f' <a href="{esc(e["url"])}">↗</a>' if e.get("url") else ""
+                lines.append(f"{TONE.get(e['tone'], '🟡')} {esc(short(e, 130))} <i>({when})</i>{link}")
+        self._send_lines(u, lines, [[("🔎 Full report", f"stock:{sym}"), ("🔄 Re-check", f"move:{sym}:{direction}")]])
 
     def high_certainty(self, u: User, hours: float = 24) -> list:
         """Stocks where the evidence clearly points one way: most signals agree, the combined
@@ -1622,7 +1904,8 @@ class Radar:
             "📊 Every alert about your stock shows its <b>overall</b> verdict from all of today's news, "
             "so one green or red item never misleads you. 🔄 tells you when that verdict flips.\n"
             "✅ <b>High certainty</b> lists only the stocks where the evidence clearly points one way.\n\n"
-            "🔎 Type any stock's name or symbol (e.g. <code>indigo</code>) to get its news and overall verdict.\n\n"
+            "🔎 Type any stock's name or symbol (e.g. <code>indigo</code>) for its news, sector, rank vs peers and AI analysis.\n"
+            "📉 Type <code>indigo fall</code> or <code>tcs rise</code> and the AI explains why it moved.\n\n"
             "Start by tapping ⭐ Portfolio → ✏️ Edit portfolio → ➕ Add stocks. "
             "Paste any headline as a message and the AI tells you what it means for stocks.")
 
@@ -1691,7 +1974,12 @@ class Radar:
         elif kind == "sure":
             self.send_certainty(u, rest)
         elif kind == "stock":
+            self.send_stock(u, rest)
+        elif kind == "stockr":
             self.send_stock(u, rest, refresh=True)
+        elif kind == "move":
+            sym, _, d = rest.partition(":")
+            self.explain_move(u, sym, d if d in ("up", "down") else "down")
         elif kind == "rmq":
             self.store.watch_remove(rest, u.chat)
             self.rebuild_matcher()
@@ -1736,6 +2024,16 @@ class Radar:
                 return self.on_text(u, "/addchannel " + text)
             if waiting == "ask":
                 return self.cmd_ask(u, text)
+            mv = self.parse_move(text)  # "indigo fall", "why did tcs rise today"
+            if mv and len(self.resolve_stock(text)) == 1:
+                mv = None  # the move word is part of a company name ("adani green")
+            if mv:
+                cands = self.resolve_stock(mv[0])
+                if len(cands) == 1:
+                    return self.explain_move(u, cands[0], mv[1])
+                if cands:
+                    return u.send("Which one did you mean?", buttons=[
+                        [(f"{c} · {(self.names.get(c) or '')[:28]}", f"move:{c}:{mv[1]}")] for c in cands])
             if len(text) <= 40 and len(text.split()) <= 5:  # looks like a stock name or symbol
                 cands = self.resolve_stock(text)
                 if len(cands) == 1:

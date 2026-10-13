@@ -211,21 +211,48 @@ def rss_time(raw: str):
             return None
 
 
-def search_company_news(session, company: str, symbol: str, days: int = 3, timeout: float = 8) -> list:
+_CORP = re.compile(r"\b(limited|ltd\.?|technologies|technology|industries|india|corporation|corp\.?|"
+                   r"company|co\.?|enterprises|services|solutions|holdings|\(india\))\b", re.I)
+
+
+def short_company(name: str) -> str:
+    """'Happiest Minds Technologies Limited' -> 'Happiest Minds' (what headlines actually say)."""
+    s = re.sub(r"\s+", " ", _CORP.sub(" ", name or "")).strip(" .,&-")
+    s = re.sub(r"\s+(of|and|&|the)$", "", s, flags=re.I).strip()
+    if len(s) < 3 or len(s.split()) == 1 and len(s) < 5 and len((name or "").split()) > 2:
+        return re.sub(r"\s+(limited|ltd\.?)$", "", name or "", flags=re.I)
+    return s
+
+
+def search_company_news(session, company: str, symbol: str, days: int = 7, timeout: float = 8,
+                        aliases=()) -> list:
     """On-demand: recent headlines about one company from Google News (hundreds of Indian outlets)."""
     from urllib.parse import quote_plus
-    q = f'"{company}" OR {symbol} share when:{days}d'
-    url = f"https://news.google.com/rss/search?q={quote_plus(q)}&hl=en-IN&gl=IN&ceid=IN:en"
-    r = session.get(url, timeout=timeout)
-    r.raise_for_status()
-    out = []
-    for it in parse_rss(r.content)[:30]:
-        title, src = split_source(it["title"], "Google News")
-        ts = rss_time(it["date"])
-        if ts is None or is_stale(title, ts, max_age_h=days * 24):
-            continue  # undated, too old, or about an old quarter
-        out.append({"title": title, "source": src, "link": it["link"], "ts": ts})
-    return out
+    short = short_company(company)
+    queries = [f'"{short}" when:{days}d', f'"{short}" shares OR stock when:{days}d']
+    if short.lower() != (company or "").lower():
+        queries.append(f'"{company}" when:{days}d')
+    for a in list(aliases or ALIASES.get(symbol, []))[:2]:
+        if len(a) >= 3 and a.lower() != short.lower():
+            queries.append(f'"{a}" shares OR stock when:{days}d')
+    out, seen = [], set()
+    for q in queries:
+        url = f"https://news.google.com/rss/search?q={quote_plus(q)}&hl=en-IN&gl=IN&ceid=IN:en"
+        try:
+            r = session.get(url, timeout=timeout)
+            r.raise_for_status()
+        except Exception:
+            continue
+        for it in parse_rss(r.content)[:40]:
+            title, src = split_source(it["title"], "Google News")
+            ts = rss_time(it["date"])
+            k = re.sub(r"\W+", "", title.lower())[:80]
+            if ts is None or k in seen or is_stale(title, ts, max_age_h=days * 24):
+                continue  # undated, duplicate, too old, or about an old quarter
+            seen.add(k)
+            out.append({"title": title, "source": src, "link": it["link"], "ts": ts})
+    out.sort(key=lambda x: -x["ts"])
+    return out[:25]
 
 
 def reporting_quarters(t=None) -> set:

@@ -161,12 +161,26 @@ move and the biggest factor, with ⏱️ if it has already moved a lot.
 ## 🔎 Type any stock
 
 Type a stock's symbol or name (`tcs`, `indigo`, `tata steel`) as a message to get:
-price and today's move, the **overall verdict** for 24 hours (and 3 days if
-different) combining positive and negative news, the **AI's net reading** with
-the main positives ➕ and negatives ➖, and the latest 10 news items with each
-one's tone. News comes from the engine's own history plus a fresh Google News
-search, so it works for any NSE stock, not only ones you track. If the name
-matches several companies, you get buttons to pick.
+
+- price, today's move next to the Nifty's, 1-week / 1-month / 1-year returns and the 52-week range
+- 🏭 **sector and industry**, and 🏁 **rank against same-industry peers** by size,
+  today's move, 1-month and 1-year return (each with the peer average), P/E vs
+  sector P/E, and the biggest peers' moves today
+- the **news verdict** for 24 hours and 7 days, combining positive and negative news
+- an **AI analysis**, always shown: what's going on, how it compares with peers,
+  main positives ➕ and negatives ➖ (the AI may only use the listed price, peer
+  and news facts, never its memory)
+- the latest 10 news items (Google News search over 7 days plus the engine's
+  own history; old-quarter stories are dropped)
+
+**Why did it move?** Type the stock with a move word: `indigo fall`, `why did
+tcs rise today`, `hal down`, `tata steel jump`. The AI explains the move from
+today's price data, peers, the Nifty and the last 4 days of news, and tags each
+reason 🏢 company, 🏭 sector or 🌐 market. If the stock actually moved the other
+way, it says so. The report also has 📉 / 📈 buttons for this.
+
+Price and peer data come from NSE; when NSE blocks the server, Yahoo Finance is
+used instead. If the name matches several companies, you get buttons to pick.
 
 ## 🏆 Track record (honest, tamper-evident)
 

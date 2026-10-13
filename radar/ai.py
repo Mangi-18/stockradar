@@ -60,6 +60,36 @@ Reply with JSON only:
   "summary": "one or two plain sentences on the net picture"}}"""
 
 
+ANALYSIS_PROMPT = """You are an Indian equity analyst. Today is {today}. Analyse {company} (NSE: {symbol})
+using ONLY the facts below. Do not add facts from memory (no past results, past events, targets
+or numbers that are not listed). If the news is thin, say so and lean on the price and peer data.
+
+FACTS
+{facts}
+
+Reply with JSON only:
+{{"direction": "up|down|mixed|none", "confidence": 0.0,
+  "summary": "2-3 plain sentences: what is going on with this stock right now and why",
+  "positives": ["short phrase", ...], "negatives": ["short phrase", ...],
+  "vs_peers": "one sentence on how it is doing compared with its sector peers"}}
+direction = which way the current news and data point for the next few sessions; "none" if nothing points either way."""
+
+MOVE_PROMPT = """You are an Indian equity analyst. Today is {today}. The user asks why {company} (NSE: {symbol})
+{asked}. Explain using ONLY the facts below; do not invent news or numbers. Separate causes specific
+to the company from sector-wide and market-wide moves (compare the stock with its peers and the Nifty).
+If the stock did not actually move the way the user says, say so plainly. If the facts don't explain
+the move, say that no clear news explains it and list what the data does show.
+
+FACTS
+{facts}
+
+Reply with JSON only:
+{{"actual_move": "up|down|flat", "matches_user": true,
+  "headline": "one sentence answer",
+  "reasons": [{{"reason": "short", "type": "company|sector|market|unclear", "evidence": "which fact shows it"}}],
+  "confidence": 0.0}}"""
+
+
 class AIReader:
     def __init__(self, key: str = "", max_per_day: int = 400, min_gap_s: float = 4.5):
         self.key = key or ""
@@ -135,6 +165,63 @@ class AIReader:
             self.last_error = str(e)[:300]
             log.warning("ai summary failed: %s", e)
             return None
+
+    def _json(self, prompt: str):
+        if not self.budget_left():
+            return None
+        wait = self.min_gap_s - (time.time() - self.last_call)
+        if wait > 0:
+            time.sleep(wait)
+        self.last_call = time.time()
+        self.calls_today += 1
+        try:
+            text = self._gemini(prompt) if self.provider == "gemini" else self._groq(prompt)
+            m = re.search(r"\{.*\}", text, re.S)
+            d = json.loads(m.group(0) if m else text)
+            self.errors = 0
+            return d
+        except Exception as e:
+            self.errors += 1
+            self.last_error = str(e)[:300]
+            log.warning("ai call failed: %s", e)
+            return None
+
+    @staticmethod
+    def _today() -> str:
+        from datetime import datetime, timedelta, timezone
+        return datetime.now(timezone(timedelta(hours=5, minutes=30))).strftime("%d %b %Y, %H:%M IST")
+
+    def analyse(self, symbol: str, company: str, facts: str) -> dict:
+        d = self._json(ANALYSIS_PROMPT.format(today=self._today(), company=company or symbol,
+                                              symbol=symbol, facts=facts))
+        if not d:
+            return None
+        try:
+            conf = max(0.0, min(1.0, float(d.get("confidence", 0) or 0)))
+        except (TypeError, ValueError):
+            conf = 0.0
+        return {"direction": str(d.get("direction", "none")).lower(), "confidence": conf,
+                "summary": str(d.get("summary", ""))[:500],
+                "positives": [str(x)[:140] for x in (d.get("positives") or [])][:4],
+                "negatives": [str(x)[:140] for x in (d.get("negatives") or [])][:4],
+                "vs_peers": str(d.get("vs_peers", ""))[:250]}
+
+    def explain_move(self, symbol: str, company: str, asked: str, facts: str) -> dict:
+        d = self._json(MOVE_PROMPT.format(today=self._today(), company=company or symbol, symbol=symbol,
+                                          asked=asked, facts=facts))
+        if not d:
+            return None
+        reasons = []
+        for r in (d.get("reasons") or [])[:5]:
+            if isinstance(r, dict) and r.get("reason"):
+                reasons.append({"reason": str(r["reason"])[:160], "type": str(r.get("type", "unclear")).lower(),
+                                "evidence": str(r.get("evidence", ""))[:160]})
+        try:
+            conf = max(0.0, min(1.0, float(d.get("confidence", 0) or 0)))
+        except (TypeError, ValueError):
+            conf = 0.0
+        return {"actual_move": str(d.get("actual_move", "")).lower(), "matches_user": bool(d.get("matches_user", True)),
+                "headline": str(d.get("headline", ""))[:300], "reasons": reasons, "confidence": conf}
 
     def _gemini(self, prompt: str) -> str:
         model = self.model or "gemini-3.5-flash-lite"

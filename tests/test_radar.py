@@ -1,3 +1,4 @@
+import re
 """Offline tests: no network. Run with  python -m pytest -q  (or python tests/test_radar.py)."""
 import os
 import sys
@@ -79,6 +80,12 @@ class FakeNSE:
         raise RuntimeError("no network")
 
 
+class NoYahoo:
+    def history(self, *a, **k):
+        raise RuntimeError("no network")
+    profile = similar = history
+
+
 def make_radar(portfolio=()):
     M.config.DB_PATH = os.path.join(tempfile.mkdtemp(), "t.db")  # fresh state per test
     r = M.Radar()
@@ -89,6 +96,8 @@ def make_radar(portfolio=()):
     r.buttons = []
     r.tg.edit = lambda mid, m, b=None, chat=None: r.sent.append(m)
     r.tg.answer = lambda cid, text="": r.sent.append("toast:" + text)
+    r.tg.typing = lambda chat=None: None
+    r.yahoo = NoYahoo()
     for p in portfolio:
         r.store.watch_add(p, "1")
     r.rebuild_matcher()
@@ -696,14 +705,14 @@ def test_type_stock_name_gets_report():
                 "ts": time.time() - 1800}]
     M.search_company_news = lambda *a, **k: fetched
     r.ai.key = "AQ.test"
-    r.ai.summarize = lambda sym, co, items: {"direction": "down", "confidence": 0.7,
-                                             "positives": ["new routes"], "negatives": ["groundings"],
-                                             "summary": "Groundings outweigh expansion."}
+    r.ai.analyse = lambda sym, co, facts: {"direction": "down", "confidence": 0.7,
+                                           "positives": ["new routes"], "negatives": ["groundings"],
+                                           "summary": "Groundings outweigh expansion.", "vs_peers": "Weaker than peers."}
     r.tg.commands = lambda: [{"type": "text", "text": "indigo", "chat": "1"}]
     r.handle_commands()
     out = r.sent[-1]
-    assert "INDIGO" in out and "Overall (24h)" in out and "negative" in out, out
-    assert "AI's net reading" in out and "➕ new routes" in out and "➖ groundings" in out
+    assert "INDIGO" in out and "News verdict (24h)" in out and "negative" in out, out
+    assert "AI analysis" in out and "➕ new routes" in out and "➖ groundings" in out and "Weaker than peers" in out
     assert "new international routes" in out and "DGCA grounds" in out
 
 
@@ -789,19 +798,21 @@ def test_old_news_is_dropped_from_stock_search():
     r = make_radar()
     r.names["HAPPSTMNDS"] = "Happiest Minds Technologies Limited"
     seen_items = []
-    def fake_search(session, company, sym, days=3, timeout=8):
+    def fake_search(session, company, sym, days=3, timeout=8, aliases=()):
         return [{"title": "Happiest Minds wins large AI deal from US bank", "source": "ET", "link": "", "ts": time.time() - 3600}]
     M.search_company_news = fake_search
     r.ai.key = "AQ.test"
-    def fake_sum(sym, co, items):
-        seen_items.extend(items)
-        return {"direction": "up", "confidence": 0.6, "positives": ["new deal"], "negatives": [], "summary": "Deal win."}
-    r.ai.summarize = fake_sum
+    def fake_an(sym, co, facts):
+        seen_items.append(facts)
+        return {"direction": "up", "confidence": 0.6, "positives": ["new deal"], "negatives": [], "summary": "Deal win.",
+                "vs_peers": ""}
+    r.ai.analyse = fake_an
     r.store.log_event("HAPPSTMNDS", "news", "Happiest Minds Q3FY26 results: profit up 12%", "+", "HIGH", "Mint")
     lines, _ = r.stock_report(r.owner, "HAPPSTMNDS")
     text = "\n".join(lines)
     assert "Q3FY26" not in text and "AI deal" in text, text
-    assert seen_items and seen_items[0][1].startswith("[")          # AI gets dated items
+    assert seen_items and "AI deal" in seen_items[0] and "Q3FY26" not in seen_items[0]
+    assert re.search(r"- \[\d\d \w{3} 20\d\d", seen_items[0])          # AI gets dated items
 
 
 def test_old_quarter_results_filing_is_ignored():
@@ -834,6 +845,116 @@ def test_certainty_scope_not_owned():
     assert "GPIL" in text and "ZENTEC" not in text and "don't own" in text
     lines, rows = r.certainty_view(r.owner, "mine")
     assert "ZENTEC" in "\n".join(lines) and "GPIL" not in "\n".join(lines)
+
+
+
+
+# ---------------------------------------------------------------- sector, peers, why did it move
+PEER_ROWS = [
+    {"symbol": "HAPPSTMNDS", "pChange": -3.0, "lastPrice": 600, "perChange30d": -8.0, "perChange365d": -20.0,
+     "ffmc": 4000, "yearHigh": 900, "yearLow": 550, "meta": {"industry": "Computers - Software & Consulting",
+                                                              "companyName": "Happiest Minds Technologies Limited"}},
+    {"symbol": "TCS", "pChange": 0.5, "lastPrice": 3000, "perChange30d": 2.0, "perChange365d": -5.0, "ffmc": 400000,
+     "meta": {"industry": "Computers - Software & Consulting", "companyName": "Tata Consultancy Services Limited"}},
+    {"symbol": "INFY", "pChange": -0.5, "lastPrice": 1500, "perChange30d": 1.0, "perChange365d": 3.0, "ffmc": 300000,
+     "meta": {"industry": "Computers - Software & Consulting", "companyName": "Infosys Limited"}},
+    {"symbol": "SBIN", "pChange": 1.0, "lastPrice": 800, "perChange30d": 4.0, "perChange365d": 10.0, "ffmc": 200000,
+     "meta": {"industry": "Public Sector Bank", "companyName": "State Bank of India"}},
+]
+
+
+def test_report_shows_sector_and_peer_rank_and_ai_even_when_neutral():
+    r = make_radar()
+    r.names["HAPPSTMNDS"] = "Happiest Minds Technologies Limited"
+    r.nse = FakeNSE(PEER_ROWS)
+    M.search_company_news = lambda *a, **k: []
+    r.ai.key = "AQ.test"
+    got = {}
+    def fake_an(sym, co, facts):
+        got["facts"] = facts
+        return {"direction": "none", "confidence": 0.3, "summary": "No fresh news; stock lagging its IT peers.",
+                "positives": [], "negatives": ["weak 1-month trend"], "vs_peers": "Worst performer among peers."}
+    r.ai.analyse = fake_an
+    lines, buttons = r.stock_report(r.owner, "HAPPSTMNDS")
+    text = "\n".join(lines)
+    assert "Computers - Software &amp; Consulting" in text, text
+    assert "Rank vs 2 peers" in text and "Size: <b>#3 of 3</b>" in text and "Today: <b>#3 of 3</b>" in text
+    assert "₹600.00" in text and "TCS" in text and "SBIN" not in text
+    assert "AI analysis" in text and "no clear direction" in text and "Worst performer" in text
+    assert "Rank among 3 industry peers by today's move: #3" in got["facts"]
+    assert any(d.startswith("move:HAPPSTMNDS:down") for row in buttons for _l, d in row)
+
+
+def test_report_without_ai_key_says_so():
+    r = make_radar()
+    r.names["TCS"] = "Tata Consultancy Services Limited"
+    r.nse = FakeNSE(PEER_ROWS)
+    M.search_company_news = lambda *a, **k: []
+    r.ai.key = ""
+    text = "\n".join(r.stock_report(r.owner, "TCS")[0])
+    assert "AI analysis is off" in text and "Size: <b>#1 of 3</b>" in text
+
+
+def test_peers_fall_back_to_yahoo_when_nse_is_blocked():
+    r = make_radar()
+    r.names.update({"HAPPSTMNDS": "Happiest Minds Technologies Limited"})
+    class BlockedNSE(FakeNSE):
+        def index_stocks(self, idx):
+            raise RuntimeError("403")
+    r.nse = BlockedNSE()
+    class Y:
+        data = {"HAPPSTMNDS": [100] * 30 + [95], "TCS": [100] * 30 + [101], "INFY": [100] * 30 + [99]}
+        def history(self, sym, ys=None):
+            c = self.data[sym] if ys is None else [100] * 31
+            return {"price": c[-1], "prev": c[-2], "closes": c, "times": list(range(len(c)))}
+        def profile(self, sym):
+            return {"sector": "Technology", "industry": "Information Technology Services"}
+        def similar(self, sym):
+            return ["TCS", "INFY"]
+    r.yahoo = Y()
+    ctx = r.stock_context("HAPPSTMNDS")
+    assert ctx["info"]["price"] == 95 and round(ctx["info"]["today"]) == -5
+    assert ctx["info"]["sector"] == "Technology"
+    assert ctx["peers"]["source"] == "Yahoo" and ctx["peers"]["rank"]["today"][:2] == (3, 3)
+
+
+def test_parse_move_words():
+    r = make_radar()
+    assert r.parse_move("indigo fall") == ("indigo", "down")
+    assert r.parse_move("why did tcs rise today?") == ("tcs", "up")
+    assert r.parse_move("Happiest minds fell") == ("happiest minds", "down")
+    assert r.parse_move("HAL up") == ("hal", "up")
+    assert r.parse_move("tcs") is None
+    assert r.parse_move("indigo up or down") is None
+    assert r.parse_move("Government raises import duty on steel, steel stocks rally hard today in trade") is None
+
+
+def test_typing_stock_fall_gets_ai_explanation():
+    r = make_radar()
+    r.names["HAPPSTMNDS"] = "Happiest Minds Technologies Limited"
+    r.nse = FakeNSE(PEER_ROWS)
+    r.nse.index_change = {"NIFTY 50": -0.2}
+    M.search_company_news = lambda *a, **k: []
+    r.ai.key = "AQ.test"
+    asked = {}
+    def fake_move(sym, co, ask, facts):
+        asked.update(sym=sym, ask=ask, facts=facts)
+        return {"actual_move": "down", "matches_user": True, "headline": "It fell more than peers on weak deal flow.",
+                "reasons": [{"reason": "Underperforming IT peers", "type": "sector", "evidence": "-3% vs peers 0%"},
+                            {"reason": "No company news", "type": "company", "evidence": ""}], "confidence": 0.5}
+    r.ai.explain_move = fake_move
+    r.tg.commands = lambda: [{"type": "text", "text": "happiest minds fall", "chat": "1"}]
+    r.handle_commands()
+    out = r.sent[-1]
+    assert asked["sym"] == "HAPPSTMNDS" and asked["ask"] == "fell"
+    assert "Nifty 50 today: -0.20%" in asked["facts"] and "peer average" in asked["facts"]
+    assert "Why did HAPPSTMNDS fall?" in out and "🏭 Sector: Underperforming IT peers" in out, out
+    assert "Today -3.00%" in out and "Nifty today -0.20%" in out
+    r.names.update({"ADANIGREEN": "Adani Green Energy Limited", "ADANIPORTS": "Adani Ports Limited"})
+    r.tg.commands = lambda: [{"type": "text", "text": "adani green", "chat": "1"}]
+    r.ai.analyse = lambda *a: None
+    r.handle_commands()
+    assert "ADANIGREEN" in r.sent[-1] and "Why did" not in r.sent[-1]
 
 
 if __name__ == "__main__":

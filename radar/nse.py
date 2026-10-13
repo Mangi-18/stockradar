@@ -31,6 +31,7 @@ class NSE:
         self.s.headers.update(HEADERS)
         self._cookies_at = 0.0
         self.index_level = {}   # index name -> (level, timestamp text) from the last index fetch
+        self.index_change = {}  # index name -> today's % change
 
     def _warm(self) -> None:
         self.s.cookies.clear()
@@ -88,9 +89,16 @@ class NSE:
         Returned in the same shape as an index row."""
         d = self.get("/api/quote-equity", {"symbol": symbol})
         p = d.get("priceInfo", {})
+        meta, ind = d.get("metadata", {}), d.get("industryInfo", {}) or {}
         return {"symbol": symbol, "lastPrice": p.get("lastPrice"), "pChange": p.get("pChange"),
-                "yearHigh": (p.get("weekHighLow") or {}).get("max"), "totalTradedVolume": None,
-                "timestamp": d.get("metadata", {}).get("lastUpdateTime", "")}
+                "previousClose": p.get("previousClose"),
+                "yearHigh": (p.get("weekHighLow") or {}).get("max"),
+                "yearLow": (p.get("weekHighLow") or {}).get("min"), "totalTradedVolume": None,
+                "timestamp": meta.get("lastUpdateTime", ""),
+                "sector": ind.get("sector") or ind.get("macro") or "",
+                "industry": ind.get("basicIndustry") or ind.get("industry") or (d.get("info") or {}).get("industry", ""),
+                "pe": meta.get("pdSymbolPe"), "sector_pe": meta.get("pdSectorPe"),
+                "sector_index": meta.get("pdSectorInd", "")}
 
     def pre_open(self, key: str = "ALL") -> list:
         """Pre-open session (9:00-9:08 IST): indicative opening price for each stock.
@@ -136,6 +144,7 @@ class NSE:
             if r.get("priority") == 1 or r.get("symbol") == index_name:
                 try:
                     self.index_level[index_name] = (float(r.get("lastPrice")), data.get("timestamp", ""))
+                    self.index_change[index_name] = float(r.get("pChange") or 0)
                 except (TypeError, ValueError):
                     pass
                 break

@@ -55,6 +55,10 @@ class Telegram:
             payload["reply_markup"] = keyboard(buttons)
         self._post("editMessageText", payload)
 
+    def typing(self, chat=None) -> None:
+        """Shows 'typing…' at the top of the chat while a slow answer (AI, web lookups) is prepared."""
+        self._post("sendChatAction", {"chat_id": str(chat or self.chat_id), "action": "typing"})
+
     def answer(self, callback_id: str, text: str = "") -> None:
         """Stops the little loading spinner on a tapped button (optionally shows a toast)."""
         self._post("answerCallbackQuery", {"callback_query_id": callback_id, "text": text[:180]})
