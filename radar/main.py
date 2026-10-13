@@ -1607,13 +1607,13 @@ class Radar:
 
     def stock_drivers(self, sym: str, industry: str = "") -> list:
         """Search queries for news that moves this stock without naming it (taxes, regulation,
-        commodities, sector events). Written by the AI once a week per stock; themes as a fallback."""
+        commodities, sector events). Written by the AI once a day per stock; themes as a fallback."""
         import json
         raw = self.store.get(f"drivers:{sym}")
         if raw:
             try:
                 d = json.loads(raw)
-                if time.time() - d["t"] < 7 * 86400 and d["q"]:
+                if time.time() - d["t"] < 86400 and d["q"]:
                     return d["q"]
             except (ValueError, KeyError, TypeError):
                 pass

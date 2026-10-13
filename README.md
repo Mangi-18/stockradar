@@ -182,7 +182,7 @@ Type a stock's symbol or name (`tcs`, `indigo`, `tata steel`) as a message to ge
   AI in plain words with what it means for the stock (no headline lists, no links;
   tap 📎 Sources if you want them). This includes **indirect news** that never names
   the company: for each stock the AI works out what moves it (e.g. for MCX:
-  securities transaction tax, SEBI F&O rules, commodity volumes), the bot searches
+  securities transaction tax, SEBI F&O rules, commodity volumes; refreshed daily), the bot searches
   those topics, and the AI explains the cause -> effect (🏭 Sector/policy items)
 
 **Why did it move?** Type the stock with a move word: `indigo fall`, `why did
