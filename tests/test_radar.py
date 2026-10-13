@@ -690,6 +690,11 @@ def test_portfolio_view_is_compact():
 
 
 # ---------------------------------------------------------------- type a stock to look it up
+def ref(facts, word):
+    """Number of the first news line in the AI facts that contains word."""
+    return int(re.search(r"^(\d+)\. .*" + word, facts, re.M).group(1))
+
+
 def test_type_stock_name_gets_report():
     import time
     r = make_radar(["TCS"])
@@ -707,13 +712,18 @@ def test_type_stock_name_gets_report():
     r.ai.key = "AQ.test"
     r.ai.analyse = lambda sym, co, facts: {"direction": "down", "confidence": 0.7,
                                            "positives": ["new routes"], "negatives": ["groundings"],
-                                           "summary": "Groundings outweigh expansion.", "vs_peers": "Weaker than peers."}
+                                           "summary": "Groundings outweigh expansion.", "vs_peers": "Weaker than peers.",
+                                           "news": [{"ref": ref(facts, "DGCA"), "what": "The aviation regulator grounded 40 IndiGo planes.",
+                                                     "effect": "Fewer flights means lower revenue.", "direction": "down", "importance": 3},
+                                                    {"ref": ref(facts, "routes"), "what": "IndiGo is starting 10 new international routes.",
+                                                     "effect": "Adds revenue over time.", "direction": "up", "importance": 1}]}
     r.tg.commands = lambda: [{"type": "text", "text": "indigo", "chat": "1"}]
     r.handle_commands()
     out = r.sent[-1]
     assert "INDIGO" in out and "News verdict (24h)" in out and "negative" in out, out
     assert "AI analysis" in out and "➕ new routes" in out and "➖ groundings" in out and "Weaker than peers" in out
-    assert "new international routes" in out and "DGCA grounds" in out
+    assert "grounded 40 IndiGo planes" in out and "For INDIGO:</i> Fewer flights" in out
+    assert "http://" not in out and "engine trouble" not in out      # explained news, not links or raw titles
 
 
 def test_ambiguous_name_offers_choices():
@@ -810,9 +820,9 @@ def test_old_news_is_dropped_from_stock_search():
     r.store.log_event("HAPPSTMNDS", "news", "Happiest Minds Q3FY26 results: profit up 12%", "+", "HIGH", "Mint")
     lines, _ = r.stock_report(r.owner, "HAPPSTMNDS")
     text = "\n".join(lines)
-    assert "Q3FY26" not in text and "AI deal" in text, text
+    assert "Q3FY26" not in text, text
     assert seen_items and "AI deal" in seen_items[0] and "Q3FY26" not in seen_items[0]
-    assert re.search(r"- \[\d\d \w{3} 20\d\d", seen_items[0])          # AI gets dated items
+    assert re.search(r"\d+\. \[C\] \[\d\d \w{3} 20\d\d", seen_items[0])          # AI gets dated items
 
 
 def test_old_quarter_results_filing_is_ignored():
@@ -955,6 +965,68 @@ def test_typing_stock_fall_gets_ai_explanation():
     r.ai.analyse = lambda *a: None
     r.handle_commands()
     assert "ADANIGREEN" in r.sent[-1] and "Why did" not in r.sent[-1]
+
+
+def test_sector_policy_news_reaches_stock_search():
+    """MCX isn't named in 'FM hints at STT, LTCG review', but the search must find and explain it."""
+    import time
+    r = make_radar()
+    r.names["MCX"] = "Multi Commodity Exchange of India Limited"
+    r.nse = FakeNSE([])
+    M.search_company_news = lambda *a, **k: []
+    queries = []
+    def fake_topic(session, q, days=3, timeout=8, limit=8):
+        queries.append(q)
+        if "transaction tax" in q:
+            return [{"title": "Sensex, Nifty extend gains on FM Sitharaman's LTCG tax, STT remark", "source": "Business Today",
+                     "link": "http://bt", "ts": time.time() - 3000}]
+        return []
+    M.search_topic = fake_topic
+    r.ai.key = "AQ.test"
+    r.ai.drivers = lambda sym, co, ind="": ["securities transaction tax", "SEBI F&O rules"]
+    seen = {}
+    def fake_an(sym, co, facts):
+        seen["facts"] = facts
+        return {"direction": "up", "confidence": 0.6, "summary": "Possible STT relief would lift volumes.", "positives": [],
+                "negatives": [], "vs_peers": "",
+                "news": [{"ref": ref(facts, "STT"), "what": "The Finance Minister hinted the government may review STT and LTCG tax.",
+                          "effect": "Lower trading taxes would raise trading volumes and MCX's fee income.",
+                          "direction": "up", "importance": 3}]}
+    r.ai.analyse = fake_an
+    text = "\n".join(r.stock_report(r.owner, "MCX")[0])
+    assert "securities transaction tax" in queries
+    assert "[S]" in seen["facts"] and "Sitharaman" in seen["facts"]
+    assert "🏭 Sector/policy" in text and "review STT" in text and "fee income" in text and "🔥" in text, text
+    assert "http://bt" not in text
+    src = "\n".join(r.sources_view("MCX"))
+    assert "http://bt" in src and "Sitharaman" in src
+    assert r.store.get("drivers:MCX")                       # AI drivers are cached, not asked every time
+
+
+def test_big_policy_news_is_pushed_to_everyone_once():
+    r = make_radar(["MCX"])
+    r.store.user_add("2", "mom")
+    r.names.update({"MCX": "Multi Commodity Exchange", "BSE": "BSE Limited", "ANGELONE": "Angel One"})
+    r.ai.key = "AQ.test"
+    reading = {"relevant": True, "priced_in": False, "importance": "high", "topic": "stt ltcg review",
+               "summary": "The Finance Minister hinted at a review of STT and LTCG tax before the Budget.",
+               "impacts": [{"symbol": "MCX", "direction": "up", "magnitude": "medium", "confidence": 0.7,
+                            "order": "second-order", "moved": False, "why": "lower STT -> more trading -> more fees"},
+                           {"symbol": "BSE", "direction": "up", "magnitude": "medium", "confidence": 0.7,
+                            "order": "second-order", "moved": False, "why": "same"},
+                           {"symbol": "ANGELONE", "direction": "up", "magnitude": "small", "confidence": 0.6,
+                            "order": "second-order", "moved": False, "why": "brokers gain"}]}
+    r.ai.read = lambda *a, **k: reading
+    r.sent.clear(); r.sent_to.clear()
+    r.handle_headline("Sensex, Nifty extend gains on FM Sitharaman's LTCG tax, STT remark", "Business Today", "")
+    big = [(m, c) for m, c in zip(r.sent, r.sent_to) if "Big market news" in m]
+    assert {c for _m, c in big} == {"1", "2"}, r.sent
+    mine = next(m for m, c in big if c == "1")
+    assert "affects your <b>MCX</b>" in mine and "review of STT" in mine and "⭐ <b>MCX</b>" in mine
+    n = len(r.sent)
+    reading["topic"] = "ltcg stt remarks"
+    r.handle_headline("FM Sitharaman says will tread cautiously on LTCG, STT", "Mint", "")
+    assert not any("Big market news" in m for m in r.sent[n:])     # same event from another outlet: no repeat
 
 
 if __name__ == "__main__":

@@ -30,7 +30,7 @@ def weight(e: dict) -> float:
         if not m:
             return 1.0
         return MAG_W[m.group(2)] * int(m.group(3)) / 100 * 1.5
-    if k == "filing":
+    if k in ("filing", "ainews"):   # ainews: a news item the AI judged for this stock (importance 1-3)
         return IMPACT_W.get(imp, 1.0)
     if k == "results":
         m = _RES.search(h)

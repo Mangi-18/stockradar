@@ -90,3 +90,4 @@ STORY_MAX_PER_DAY = int(_float("STORY_MAX_PER_DAY", 10))
 # --- ⚡ Breaking alerts: a single headline/filing the AI judges a LARGE, confident move ---
 BREAKING_MIN_CONF = _float("BREAKING_MIN_CONF", 0.8)   # 0-1
 BREAKING_MAX_PER_DAY = int(_float("BREAKING_MAX_PER_DAY", 10))
+MACRO_MAX_PER_DAY = int(_float("MACRO_MAX_PER_DAY", 6))   # 🏛️ big market-moving news (budget, tax, RBI, SEBI...)

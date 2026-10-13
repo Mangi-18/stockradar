@@ -23,7 +23,7 @@ from .channels import Channels, clean_name
 from .classify import HIGH, MEDIUM, classify
 from .outlook import outlook, short
 from .news import (ALIASES, DEFAULT_FEEDS, NewsFeeds, analyse_headline, build_market_matcher,
-                   build_matcher, is_stale, rss_time, search_company_news, split_source, tone)
+                   THEMES, build_matcher, is_stale, rss_time, search_company_news, search_topic, split_source, tone)
 from .market import Yahoo, returns
 from .nse import NSE
 from .results import analyse, crore
@@ -83,6 +83,15 @@ def event_label(e: dict) -> str:
     if k == "deal":
         return "bulk/block buy"
     return classify(h)["label"]
+
+
+# Fallback news searches per theme (used when no AI key is set)
+THEME_QUERIES = {"Defence": "defence ministry order", "Railways": "railway budget order", "Crude oil": "crude oil price",
+                 "Steel / metals": "steel import duty", "RBI / rates": "RBI repo rate", "Pharma / USFDA": "USFDA India pharma",
+                 "IT / US": "H-1B visa IT services", "Power / renewables": "power demand India",
+                 "Gold": "gold price India", "Telecom": "telecom tariff", "Autos": "auto sales India",
+                 "Rural / FMCG": "monsoon rural demand", "Capital markets / STT": "securities transaction tax",
+                 "Infra / capex": "infrastructure capex India"}
 
 
 # Per-person settings: name -> (config attribute holding the default, type, description)
@@ -164,6 +173,8 @@ class Radar:
         self._report_cache = {}      # symbol -> (time, AI analysis)
         self._news_cache = {}        # symbol -> (time, Google News headlines)
         self._ctx_cache = {}         # symbol -> (time, price/sector/peers/news context)
+        self._sector_cache = {}      # symbol -> (time, sector/policy headlines)
+        self._macro = []             # recent 🏛️ big-news events (time, topic words, symbols) to avoid repeats
         self._rows, self._rows_at, self._rows_fail_at = {}, 0.0, 0.0   # NSE rows used for peer ranking
         self.yahoo = Yahoo()
         self.awaiting = {}           # chat -> what their next typed message means
@@ -691,7 +702,8 @@ class Radar:
         if not self.ai.provider or a["already_moved"]:
             return False
         # Each AI read takes a few seconds; cap per news cycle so filings/prices never wait long.
-        if self._ai_cycle >= 6 and not mine:
+        policy = bool(a["themes"] or self.POLICY.search(a.get("_title", "")))
+        if self._ai_cycle >= (12 if policy else 6) and not mine:
             return False
         self._ai_cycle += 1
         spreading = any(self.store.news_sources(s, config.STORY_WINDOW_H) >= config.STORY_MIN_OUTLETS - 1
@@ -709,7 +721,7 @@ class Radar:
         mine = [s for s in syms if s in held]
 
         # --- AI reasoning: who is affected, which way, and why (incl. second-order effects)
-        ai_imp = []
+        ai_imp, ai = [], None
         if self.wants_ai(a, c, syms, mine):
             ai = self.ai.read(title, src, sorted(held))
             if ai:
@@ -720,6 +732,9 @@ class Radar:
                     ai_imp = [i for i in ai["impacts"] if i["confidence"] >= 0.5
                               and (i["symbol"] in self.names or i["symbol"] in held)]
         ai_by = {i["symbol"]: i for i in ai_imp}
+        macro = bool(ai and ai["relevant"] and ai.get("importance") == "high" and ai_imp)
+        if macro:
+            self.macro_alert(title, src, link, ai, ai_imp)
 
         if a["already_moved"]:
             title_logged, label = title + " (already moving)", "⏱️ already moving"
@@ -740,7 +755,7 @@ class Radar:
             self.store.log_event(s, "ai", f"AI: {'↑' if up else '↓'} {i['magnitude']} ({i['confidence']:.0%}) — "
                                  f"{i['why']} [{title[:120]}]", "+" if up else "-", HIGH if strong else MEDIUM, src, link)
             self.store.add_filing(s, f"AI: {i['why']}", HIGH if strong else MEDIUM, link)
-            if not a["already_moved"]:
+            if not a["already_moved"] and not i.get("moved"):
                 self.store.track(s, "ai", f"AI {i['magnitude']}", 1 if up else -1)
         for name, _ in a["themes"]:
             self.store.log_event("", "theme:" + name, title, t, "MEDIUM", src, link)
@@ -761,12 +776,13 @@ class Radar:
             self.consider(s)
         if not a["already_moved"]:
             for i in ai_imp:
-                self.breaking_check(i, title, src, link)
+                if not i.get("moved"):
+                    self.breaking_check(i, title, src, link)
         for s in syms:
             self.story_check(s, title, src, ai_by.get(s), a["already_moved"])
 
         # --- sector / policy news: ping only people it affects; others get it in the digest
-        if a["themes"] and config.NEWS_THEMES and not a["already_moved"]:
+        if a["themes"] and config.NEWS_THEMES and not a["already_moved"] and not macro:
             name, exposed = a["themes"][0]
             if ai_by:
                 who = ", ".join(f"{s} {'↑' if i['direction'] == 'up' else '↓'}" for s, i in ai_by.items())
@@ -785,6 +801,42 @@ class Radar:
                     u.queue("", msg, 30)
         elif a["global"] and a["dramatic"] and self.store.first_time(f"global:{int(time.time() // 3600)}"):
             self.broadcast(f"🌍 <b>Global cue</b>\n{esc(title)}\n{stamp}")
+
+    def macro_alert(self, title: str, src: str, link: str, ai: dict, imps: list) -> None:
+        """🏛️ Big market-moving news (budget, taxes, RBI, SEBI, government, global shocks): sent to everyone
+        once per event, explained in plain words with who gains and who loses, even if no stock is named."""
+        words = set(re.findall(r"[a-z0-9]+", ai.get("topic", ""))) or set(re.findall(r"[a-z0-9]{4,}", title.lower()))
+        syms = {i["symbol"] for i in imps}
+        cutoff = time.time() - 12 * 3600
+        self._macro = [m for m in self._macro if m[0] > cutoff]
+        for _t, w, ss in self._macro:   # the same event reported by another outlet
+            if (w and len(w & words) / max(1, min(len(w), len(words))) >= 0.5) or len(ss & syms) >= max(2, len(syms) * 2 // 3):
+                return False
+        self._macro.append((time.time(), words, syms))
+        ups = [i for i in imps if i["direction"] == "up"]
+        downs = [i for i in imps if i["direction"] == "down"]
+        day = now().strftime("%Y-%m-%d")
+        topic = re.sub(r"\W+", "-", ai.get("topic") or title.lower())[:40]
+        for u in self.users():
+            mine = [i["symbol"] for i in imps if i["symbol"] in u.portfolio()]
+            lines = [f"🏛️ <b>Big market news</b>" + (f" · affects your <b>{esc(', '.join(mine))}</b>" if mine else "")]
+            lines.append(esc(ai.get("summary") or title))
+            for label, group in (("🟢 Likely to gain", ups), ("🔴 Likely to lose", downs)):
+                if group:
+                    lines.append(f"\n<b>{label}</b>")
+                    for i in group[:4]:
+                        star = "⭐ " if i["symbol"] in u.portfolio() else ""
+                        lines.append(f"{star}<b>{esc(i['symbol'])}</b> ({i['magnitude']}, {i['confidence']:.0%}): {esc(i['why'])}"
+                                     + (" ⏱️ already moved" if i.get("moved") else ""))
+            lines.append(f"<i>{esc(src)} · {now().strftime('%d %b %H:%M')}</i>")
+            msg = "\n".join(lines)
+            if self.store.has_seen(u.key("macro", day, topic)):
+                continue
+            if (u.quiet() and not mine) or u.count("macro", day) >= config.MACRO_MAX_PER_DAY:
+                u.queue("", msg, 70)
+                continue
+            self.store.first_time(u.key("macro", day, topic))
+            u.send(msg, buttons=[[(f"🔎 {i['symbol']}", f"stock:{i['symbol']}") for i in imps[:3]]])
 
     def breaking_check(self, i: dict, title: str, src: str, link: str) -> None:
         """⚡ One headline or filing that the AI judges a LARGE move with high confidence.
@@ -1553,19 +1605,82 @@ class Radar:
         events.sort(key=lambda e: e["ts"])
         return events
 
+    def stock_drivers(self, sym: str, industry: str = "") -> list:
+        """Search queries for news that moves this stock without naming it (taxes, regulation,
+        commodities, sector events). Written by the AI once a week per stock; themes as a fallback."""
+        import json
+        raw = self.store.get(f"drivers:{sym}")
+        if raw:
+            try:
+                d = json.loads(raw)
+                if time.time() - d["t"] < 7 * 86400 and d["q"]:
+                    return d["q"]
+            except (ValueError, KeyError, TypeError):
+                pass
+        qs = []
+        if self.ai.provider:
+            qs = self.ai.drivers(sym, self.names.get(sym, ""), industry)
+            if qs:
+                self.store.set(f"drivers:{sym}", json.dumps({"t": time.time(), "q": qs}))
+        if not qs:
+            qs = [THEME_QUERIES[name] for name, (_rx, stocks) in THEMES.items() if sym in stocks and name in THEME_QUERIES]
+            if industry:
+                qs.append(f"{industry} sector India")
+        return qs[:6]
+
+    def sector_events(self, sym: str, industry: str = "", hours: float = 72) -> list:
+        """Indirect news: policy/tax/sector/commodity headlines that can move this stock without naming it.
+        From the engine's own sector log plus a fresh Google News search on the stock's drivers."""
+        out, seen = [], set()
+        mine = {f"theme:{name}" for name, (_rx, stocks) in THEMES.items() if sym in stocks}
+        for e in self.store.events_since(time.time() - hours * 3600):
+            if e["kind"] in mine and not is_stale(e["headline"], e["ts"]):
+                k = re.sub(r"\W+", "", e["headline"].lower())[:70]
+                if k not in seen:
+                    seen.add(k)
+                    out.append({**e, "symbol": sym, "kind": "sector"})
+        cached = self._sector_cache.get(sym)
+        if cached and time.time() - cached[0] < 1200:
+            fetched = cached[1]
+        else:
+            fetched = []
+            for q in self.stock_drivers(sym, industry):
+                try:
+                    fetched += search_topic(self.news.s, q, days=max(1, int(hours // 24)), limit=5)
+                except Exception as e:
+                    log.info("topic search %r: %s", q, e)
+            self._sector_cache[sym] = (time.time(), fetched)
+        for f in fetched:
+            k = re.sub(r"\W+", "", f["title"].lower())[:70]
+            if k in seen or time.time() - f["ts"] > hours * 3600:
+                continue
+            seen.add(k)
+            out.append({"ts": f["ts"], "symbol": sym, "kind": "sector", "headline": f["title"], "tone": "?",
+                        "impact": MEDIUM, "source": f["source"], "url": f["link"]})
+        out.sort(key=lambda e: -e["ts"])
+        return out[:20]
+
     def stock_context(self, sym: str) -> dict:
         cached = self._ctx_cache.get(sym)
         if cached and time.time() - cached[0] < 600:
             return cached[1]
         info = self.price_info(sym)
         ctx = {"sym": sym, "company": self.names.get(sym, "") or sym, "info": info,
-               "nifty": self.nifty_today(), "peers": self.peer_info(sym, info), "events": self.stock_events(sym)}
+               "nifty": self.nifty_today(), "peers": self.peer_info(sym, info), "events": self.stock_events(sym),
+               "sector": self.sector_events(sym, info.get("industry", ""))}
         self._ctx_cache[sym] = (time.time(), ctx)
         return ctx
 
     @staticmethod
     def _pct(x, digits=1):
         return "n/a" if x is None else f"{x:+.{digits}f}%"
+
+    def news_items(self, ctx: dict, hours: float = 168) -> list:
+        """The numbered list the AI reads: (tag, event). [C] = about the company, [S] = sector/policy/macro."""
+        t0 = time.time() - hours * 3600
+        comp = [("S" if e["kind"] == "ai" else "C", e) for e in reversed(ctx["events"]) if e["ts"] >= t0][:14]
+        sect = [("S", e) for e in ctx.get("sector", []) if e["ts"] >= min(t0, time.time() - 72 * 3600)][:12]
+        return comp + sect
 
     def facts_text(self, ctx: dict, news_hours: float = 168) -> str:
         """Plain-text facts handed to the AI (it is told to use nothing else)."""
@@ -1588,14 +1703,14 @@ class Radar:
             f.append("Peers: " + "; ".join(
                 f"{p['symbol']} today {self._pct(p['today'])}, 1m {self._pct(p['1m'])}"
                 for p in pr["peers"][:8] if p["symbol"] != ctx["sym"]) + ".")
-        ev = [e for e in reversed(ctx["events"]) if time.time() - e["ts"] <= news_hours * 3600][:15]
-        if ev:
-            f.append("News (newest first):")
-            for e in ev:
+        items = self.news_items(ctx, news_hours)
+        if items:
+            f.append("News (numbered; [C] = about the company, [S] = sector/policy/macro that may affect it):")
+            for n, (tag, e) in enumerate(items, 1):
                 when = datetime.fromtimestamp(e["ts"], IST).strftime("%d %b %Y %H:%M")
-                f.append(f"- [{when}] {short(e, 180)} ({e['source'] or e['kind']})")
+                f.append(f"{n}. [{tag}] [{when}] {short(e, 200)} ({e['source'] or e['kind']})")
         else:
-            f.append("News: no news items found for this stock in this period.")
+            f.append("News: no news items found for this stock or its sector in this period.")
         return "\n".join(f)
 
     def peer_lines(self, ctx: dict) -> list:
@@ -1647,8 +1762,21 @@ class Radar:
             lines.append("💰 Price not available right now.")
         lines += self.peer_lines(ctx)
 
-        o = outlook([e for e in events if time.time() - e["ts"] <= 24 * 3600])
-        o7 = outlook(events)
+        items = self.news_items(ctx)
+        explained = []   # (tag, event, AI's reading) for the items the AI says matter for this stock
+        if analysis:
+            for n in analysis.get("news", []):
+                if 1 <= n["ref"] <= len(items):
+                    tag, e = items[n["ref"] - 1]
+                    explained.append((tag, e, n))
+        if explained:
+            judged = [{"ts": e["ts"], "kind": "ainews", "headline": n["what"], "source": e["source"],
+                       "tone": {"up": "+", "down": "-"}.get(n["direction"], "?"),
+                       "impact": {3: "HIGH", 2: "MEDIUM"}.get(n["importance"], "LOW")} for _t, e, n in explained]
+        else:   # no AI: keyword tones of news that names the company (sector items can't be judged by keywords)
+            judged = events
+        o = outlook([e for e in judged if time.time() - e["ts"] <= 24 * 3600])
+        o7 = outlook(judged)
         lines.append("")
         if o["label"]:
             lines.append(f"📊 <b>News verdict (24h): {o['label']}</b> · {o['pos']} positive vs {o['neg']} negative")
@@ -1674,22 +1802,44 @@ class Radar:
         else:
             lines.append(f"\n🤖 AI analysis unavailable right now ({'daily limit reached' if not self.ai.budget_left() else 'AI call failed'}). Tap 🔄 Refresh to retry.")
 
-        if events:
-            lines.append(f"\n<b>Latest news</b> ({len(events)} in 7 days)")
-            for e in list(reversed(events))[:10]:
-                when = datetime.fromtimestamp(e["ts"], IST).strftime("%d %b %H:%M")
-                link = f' <a href="{esc(e["url"])}">↗</a>' if e.get("url") else ""
-                lines.append(f"{TONE.get(e['tone'], '🟡')} {esc(short(e, 140))} <i>({esc(e['source'] or e['kind'])}, {when})</i>{link}")
-        lines.append("<i>Verdict combines all items, weighted by importance and recency. Not a guarantee.</i>")
+        if explained:
+            lines.append("\n📰 <b>What's happening</b>")
+            for tag, e, n in explained:
+                dot = {"up": "🟢", "down": "🔴"}.get(n["direction"], "⚪")
+                when = datetime.fromtimestamp(e["ts"], IST).strftime("%d %b")
+                kind = "🏭 Sector/policy · " if tag == "S" else ""
+                lines.append(f"{dot} {'🔥 ' if n['importance'] == 3 else ''}{kind}<b>{when}</b> · {esc(n['what'])}")
+                if n["effect"]:
+                    lines.append(f"      ↳ <i>For {esc(sym)}:</i> {esc(n['effect'])} <i>({esc(e['source'] or e['kind'])})</i>")
+        elif analysis is not None and items:
+            lines.append("\n📰 None of this week's news looks price-relevant for this stock.")
+        elif items:
+            lines.append("\n📰 <b>Latest headlines</b> <i>(AI off, so they aren't explained)</i>")
+            for tag, e in items[:8]:
+                when = datetime.fromtimestamp(e["ts"], IST).strftime("%d %b")
+                lines.append(f"{'🏭' if tag == 'S' else TONE.get(e['tone'], '🟡')} {when} · {esc(short(e, 140))}")
+        else:
+            lines.append("\n📰 No news found about this stock or its sector in the last 7 days.")
+        lines.append("<i>Verdict weighs every item by importance and recency. Not a guarantee.</i>")
         held = sym in u.portfolio()
         buttons = [[("❌ Remove from portfolio" if held else f"➕ Add {sym} to portfolio", f"rmq:{sym}" if held else f"add:{sym}"),
                     ("🔄 Refresh", f"stockr:{sym}")],
-                   [("📉 Why is it falling?", f"move:{sym}:down"), ("📈 Why is it rising?", f"move:{sym}:up")]]
+                   [("📉 Why is it falling?", f"move:{sym}:down"), ("📈 Why is it rising?", f"move:{sym}:up")],
+                   [("📎 Sources", f"src:{sym}")]]
         return lines, buttons
+
+    def sources_view(self, sym: str) -> list:
+        ctx = self.stock_context(sym)
+        lines = [f"📎 <b>Sources for {esc(sym)}</b> (newest first)"]
+        for tag, e in self.news_items(ctx)[:20]:
+            when = datetime.fromtimestamp(e["ts"], IST).strftime("%d %b %H:%M")
+            link = f' <a href="{esc(e["url"])}">open</a>' if e.get("url") else ""
+            lines.append(f"{'🏭' if tag == 'S' else '🏢'} {esc(short(e, 120))} <i>({esc(e['source'] or e['kind'])}, {when})</i>{link}")
+        return lines
 
     def send_stock(self, u: User, sym: str, refresh: bool = False) -> None:
         if refresh:
-            for c in (self._report_cache, self._ctx_cache, self._news_cache):
+            for c in (self._report_cache, self._ctx_cache, self._news_cache, self._sector_cache):
                 c.pop(sym, None)
         self.tg.typing(u.chat)
         lines, buttons = self.stock_report(u, sym)
@@ -1754,19 +1904,13 @@ class Radar:
             for x in r["reasons"]:
                 lines.append(f"{tag.get(x['type'], '❔ Unclear')}: {esc(x['reason'])}"
                              + (f"\n      <i>↳ {esc(x['evidence'])}</i>" if x["evidence"] else ""))
-            lines.append(f"<i>AI confidence {r['confidence']:.0%}. Based only on the price data and news listed in the report.</i>")
+            lines.append(f"<i>AI confidence {r['confidence']:.0%}. Based only on price data, peers, and company + sector/policy news (📎 Sources).</i>")
         elif not self.ai.provider:
             lines.append("🤖 AI is off: the owner can add a free AI key (☰ More → 🔑 AI key).")
         else:
-            lines.append("🤖 AI explanation unavailable right now (daily limit or AI error). Recent news below.")
-        ev = [e for e in reversed(ctx["events"]) if time.time() - e["ts"] <= 96 * 3600][:5]
-        if ev:
-            lines.append("\n<b>Recent news</b>")
-            for e in ev:
-                when = datetime.fromtimestamp(e["ts"], IST).strftime("%d %b %H:%M")
-                link = f' <a href="{esc(e["url"])}">↗</a>' if e.get("url") else ""
-                lines.append(f"{TONE.get(e['tone'], '🟡')} {esc(short(e, 130))} <i>({when})</i>{link}")
-        self._send_lines(u, lines, [[("🔎 Full report", f"stock:{sym}"), ("🔄 Re-check", f"move:{sym}:{direction}")]])
+            lines.append("🤖 AI explanation unavailable right now (daily limit or AI error). Tap 📎 Sources for the news.")
+        self._send_lines(u, lines, [[("🔎 Full report", f"stock:{sym}"), ("🔄 Re-check", f"move:{sym}:{direction}")],
+                                    [("📎 Sources", f"src:{sym}")]])
 
     def high_certainty(self, u: User, hours: float = 24) -> list:
         """Stocks where the evidence clearly points one way: most signals agree, the combined
@@ -1975,6 +2119,8 @@ class Radar:
             self.send_certainty(u, rest)
         elif kind == "stock":
             self.send_stock(u, rest)
+        elif kind == "src":
+            u.send_long(self.sources_view(rest))
         elif kind == "stockr":
             self.send_stock(u, rest, refresh=True)
         elif kind == "move":

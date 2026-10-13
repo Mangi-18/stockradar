@@ -59,6 +59,10 @@ THEMES = {
               ["MARUTI", "M&M", "TATAMOTORS", "BAJAJ-AUTO", "EICHERMOT", "HEROMOTOCO", "TVSMOTOR", "ASHOKLEY"]),
     "Rural / FMCG": (r"monsoon|rainfall|msp hike|rural demand|gst (cut|rate)",
                      ["HINDUNILVR", "DABUR", "MARICO", "BRITANNIA", "ITC", "COLPAL", "M&M", "UPL"]),
+    "Capital markets / STT": (r"\bstt\b|securities transaction tax|commodit(y|ies) transaction tax|\bctt\b|\bltcg\b|"
+                              r"capital gains? tax|f&o (rules|curbs|framework|volumes?|trading)|derivatives? (curbs|rules|volumes?)|"
+                              r"demat accounts?|trading volumes?|retail (investors|participation)|sebi (curbs|tightens|eases)",
+                              ["BSE", "MCX", "CDSL", "CAMS", "KFINTECH", "ANGELONE", "MOTILALOFS", "NUVAMA", "HDFCAMC", "NAM-INDIA"]),
     "Infra / capex": (r"infrastructure push|capex|highway|nhai|metro project|smart cit",
                       ["LT", "IRB", "KNRCON", "PNCINFRA", "NCC", "ULTRACEMCO", "SIEMENS", "ABB"]),
 }
@@ -253,6 +257,23 @@ def search_company_news(session, company: str, symbol: str, days: int = 7, timeo
             out.append({"title": title, "source": src, "link": it["link"], "ts": ts})
     out.sort(key=lambda x: -x["ts"])
     return out[:25]
+
+
+def search_topic(session, query: str, days: int = 3, timeout: float = 8, limit: int = 8) -> list:
+    """Recent Google News headlines for a topic ("securities transaction tax"), newest first."""
+    from urllib.parse import quote_plus
+    url = f"https://news.google.com/rss/search?q={quote_plus(query + f' when:{days}d')}&hl=en-IN&gl=IN&ceid=IN:en"
+    r = session.get(url, timeout=timeout)
+    r.raise_for_status()
+    out = []
+    for it in parse_rss(r.content)[:30]:
+        title, src = split_source(it["title"], "Google News")
+        ts = rss_time(it["date"])
+        if ts is None or is_stale(title, ts, max_age_h=days * 24):
+            continue
+        out.append({"title": title, "source": src, "link": it["link"], "ts": ts})
+    out.sort(key=lambda x: -x["ts"])
+    return out[:limit]
 
 
 def reporting_quarters(t=None) -> set:

@@ -20,7 +20,9 @@ log = logging.getLogger("ai")
 
 PROMPT = """You are an Indian equity analyst. Read this news headline and work out which
 NSE-listed companies' share prices it is likely to move, including SECOND-ORDER effects
-(suppliers, customers, competitors, import/export exposure, input costs).
+(suppliers, customers, competitors, regulation, taxes, import/export exposure, input costs).
+Example: "FM hints at review of STT and LTCG tax" -> lower trading costs and more trading
+-> exchanges and brokers (MCX, BSE, ANGELONE, CDSL) up, even though none is named.
 
 Headline: "{headline}"
 Source: {source}
@@ -28,17 +30,25 @@ Stocks the user owns (pay special attention): {portfolio}
 
 Rules:
 - Only real NSE-listed Indian companies, with their exact NSE trading symbol (e.g. TATASTEEL, LICI, HAL).
-- At most 5 companies, most affected first. Empty list if the headline is not price-relevant
-  (opinion pieces, generic market commentary, stock tips, already-reported price moves).
+- At most 6 companies, most affected first. Empty list if the headline is not price-relevant
+  (opinion pieces, generic market commentary, stock tips).
 - direction: "up" or "down". magnitude: "small" (<2%), "medium" (2-5%), "large" (>5%) expected move.
 - confidence: 0.0-1.0, how sure you are about the direction. Be conservative.
-- why: one short sentence with the cause -> effect chain.
-- priced_in: true if the headline reports a move that already happened ("shares jump 8%").
+- why: one short sentence with the cause -> effect chain, in plain words.
+- moved: true only if the headline itself reports that THIS company's share price already moved
+  (a headline saying "Sensex gains on X" does not mean the second-order stocks have moved).
+- summary: one or two plain sentences saying what actually happened (no jargon, no headline copy).
+- importance: how much this matters to Indian investors overall: "low", "medium", or "high"
+  (high = budget/tax/RBI/SEBI/government decisions, wars, big global shocks, sector-wide changes).
+- topic: 2-5 word label for the underlying event, the same for every outlet's version of it
+  (e.g. "STT LTCG review").
 
 Reply with JSON only:
-{{"relevant": true/false, "priced_in": true/false,
+{{"relevant": true/false, "priced_in": true/false, "summary": "...", "importance": "low|medium|high",
+  "topic": "...",
   "impacts": [{{"symbol": "...", "direction": "up|down", "magnitude": "small|medium|large",
-               "confidence": 0.0, "order": "direct|second-order", "why": "..."}}]}}"""
+               "confidence": 0.0, "order": "direct|second-order", "moved": false, "why": "..."}}]}}
+priced_in = true only if every company listed has already moved on this news."""
 
 
 SUMMARY_PROMPT = """You are an Indian equity analyst. Today is {today}. Below are the news items about
@@ -62,7 +72,11 @@ Reply with JSON only:
 
 ANALYSIS_PROMPT = """You are an Indian equity analyst. Today is {today}. Analyse {company} (NSE: {symbol})
 using ONLY the facts below. Do not add facts from memory (no past results, past events, targets
-or numbers that are not listed). If the news is thin, say so and lean on the price and peer data.
+or numbers that are not listed). The news list has two kinds of items:
+  [C] news about the company itself
+  [S] sector, policy, tax, regulatory and macro news that may affect it INDIRECTLY
+For [S] items, think through the cause -> effect chain for THIS company (e.g. a cut in
+securities transaction tax -> more trading -> more fee income for an exchange).
 
 FACTS
 {facts}
@@ -71,8 +85,21 @@ Reply with JSON only:
 {{"direction": "up|down|mixed|none", "confidence": 0.0,
   "summary": "2-3 plain sentences: what is going on with this stock right now and why",
   "positives": ["short phrase", ...], "negatives": ["short phrase", ...],
-  "vs_peers": "one sentence on how it is doing compared with its sector peers"}}
-direction = which way the current news and data point for the next few sessions; "none" if nothing points either way."""
+  "vs_peers": "one sentence on how it is doing compared with its sector peers",
+  "news": [{{"ref": 1, "what": "what happened, in 1-2 plain sentences of your own (not the headline)",
+            "effect": "what it means for {symbol} and why, one sentence",
+            "direction": "up|down|neutral", "importance": 1}}]}}
+direction = which way the current news and data point for the next few sessions; "none" if nothing points either way.
+news: the items that actually matter for {symbol}, most important first, at most 8. Merge items that report
+the same event into one (use the ref of the clearest one). Leave out items irrelevant to {symbol}, duplicates,
+and items that only report a price move. importance: 3 = could move the stock a lot, 2 = noticeable, 1 = minor."""
+
+DRIVERS_PROMPT = """You are an Indian equity analyst. List what kinds of NEWS move the share price of
+{company} (NSE: {symbol}){industry}, beyond news that names the company: regulation, taxes, government
+policy, commodity or currency prices, sector events, key customers or competitors.
+Give 6 short Google News search queries (2-4 words each) that would find such news in India today.
+Examples for an exchange: "securities transaction tax", "SEBI F&O rules", "commodity derivatives volume".
+Reply with JSON only: {{"queries": ["...", ...]}}"""
 
 MOVE_PROMPT = """You are an Indian equity analyst. Today is {today}. The user asks why {company} (NSE: {symbol})
 {asked}. Explain using ONLY the facts below; do not invent news or numbers. Separate causes specific
@@ -204,7 +231,13 @@ class AIReader:
                 "summary": str(d.get("summary", ""))[:500],
                 "positives": [str(x)[:140] for x in (d.get("positives") or [])][:4],
                 "negatives": [str(x)[:140] for x in (d.get("negatives") or [])][:4],
-                "vs_peers": str(d.get("vs_peers", ""))[:250]}
+                "vs_peers": str(d.get("vs_peers", ""))[:250], "news": _news_items(d.get("news"))}
+
+    def drivers(self, symbol: str, company: str, industry: str = "") -> list:
+        d = self._json(DRIVERS_PROMPT.format(symbol=symbol, company=company or symbol,
+                                             industry=f", industry: {industry}" if industry else ""))
+        qs = [re.sub(r'["\n]', "", str(q)).strip()[:60] for q in ((d or {}).get("queries") or [])]
+        return [q for q in qs if len(q) >= 3][:6]
 
     def explain_move(self, symbol: str, company: str, asked: str, facts: str) -> dict:
         d = self._json(MOVE_PROMPT.format(today=self._today(), company=company or symbol, symbol=symbol,
@@ -254,11 +287,33 @@ class AIReader:
     model = ""
 
 
+def _news_items(raw) -> list:
+    out = []
+    for n in raw or []:
+        if not isinstance(n, dict) or not n.get("what"):
+            continue
+        try:
+            ref = int(n.get("ref", 0))
+        except (TypeError, ValueError):
+            ref = 0
+        try:
+            imp = max(1, min(3, int(n.get("importance", 1))))
+        except (TypeError, ValueError):
+            imp = 1
+        d = str(n.get("direction", "neutral")).lower()
+        out.append({"ref": ref, "what": str(n["what"])[:300], "effect": str(n.get("effect", ""))[:250],
+                    "direction": d if d in ("up", "down") else "neutral", "importance": imp})
+    return out[:8]
+
+
 def parse_json(text: str) -> dict:
     text = text.strip()
     m = re.search(r"\{.*\}", text, re.S)
     data = json.loads(m.group(0) if m else text)
-    out = {"relevant": bool(data.get("relevant")), "priced_in": bool(data.get("priced_in")), "impacts": []}
+    imp = str(data.get("importance", "low")).lower()
+    out = {"relevant": bool(data.get("relevant")), "priced_in": bool(data.get("priced_in")), "impacts": [],
+           "summary": str(data.get("summary", ""))[:400], "importance": imp if imp in ("low", "medium", "high") else "low",
+           "topic": re.sub(r"\s+", " ", str(data.get("topic", ""))).strip().lower()[:60]}
     for i in data.get("impacts") or []:
         try:
             sym = re.sub(r"[^A-Z0-9&-]", "", str(i.get("symbol", "")).upper())
@@ -270,8 +325,9 @@ def parse_json(text: str) -> dict:
                 "magnitude": str(i.get("magnitude", "small")).lower(),
                 "confidence": max(0.0, min(1.0, float(i.get("confidence", 0)))),
                 "order": str(i.get("order", "direct")).lower(),
+                "moved": bool(i.get("moved", False)),
                 "why": str(i.get("why", ""))[:200]})
         except (TypeError, ValueError):
             continue
-    out["impacts"] = out["impacts"][:5]
+    out["impacts"] = out["impacts"][:6]
     return out

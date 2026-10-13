@@ -158,6 +158,14 @@ evidence score is 70+ or the AI is 80%+ confident. No count limit; it can be 0
 stocks or 20. Each shows the agreement %, evidence score, AI confidence, today's
 move and the biggest factor, with ⏱️ if it has already moved a lot.
 
+## 🏛️ Big market news
+
+Budget, tax, RBI, SEBI and government decisions and big global shocks are pushed
+to everyone the moment the AI rates them high-importance, even when no company is
+named. Each alert explains what happened in plain words and lists who is likely
+to gain 🟢 and lose 🔴 and why (⭐ marks your stocks). The same event reported by
+several outlets is sent once. Max 6 a day (`MACRO_MAX_PER_DAY`).
+
 ## 🔎 Type any stock
 
 Type a stock's symbol or name (`tcs`, `indigo`, `tata steel`) as a message to get:
@@ -170,8 +178,12 @@ Type a stock's symbol or name (`tcs`, `indigo`, `tata steel`) as a message to ge
 - an **AI analysis**, always shown: what's going on, how it compares with peers,
   main positives ➕ and negatives ➖ (the AI may only use the listed price, peer
   and news facts, never its memory)
-- the latest 10 news items (Google News search over 7 days plus the engine's
-  own history; old-quarter stories are dropped)
+- 📰 **What's happening**: the news that matters for this stock, rewritten by the
+  AI in plain words with what it means for the stock (no headline lists, no links;
+  tap 📎 Sources if you want them). This includes **indirect news** that never names
+  the company: for each stock the AI works out what moves it (e.g. for MCX:
+  securities transaction tax, SEBI F&O rules, commodity volumes), the bot searches
+  those topics, and the AI explains the cause -> effect (🏭 Sector/policy items)
 
 **Why did it move?** Type the stock with a move word: `indigo fall`, `why did
 tcs rise today`, `hal down`, `tata steel jump`. The AI explains the move from
